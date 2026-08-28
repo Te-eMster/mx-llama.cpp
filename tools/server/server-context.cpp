@@ -17,7 +17,7 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
-#include "../../src/llama-memory.h"
+//#include "../../src/llama-memory.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -53,10 +53,10 @@ static common_speculative_output_limits server_output_limits(const common_params
     return result;
 }
 
-static bool server_memory_can_checkpoint(llama_context * ctx) {
-    llama_memory_t mem = llama_get_memory(ctx);
-    return mem && mem->get_can_checkpoint();
-}
+//static bool server_memory_can_checkpoint(llama_context * ctx) {
+//    llama_memory_t mem = llama_get_memory(ctx);
+//    return mem && mem->get_can_checkpoint();
+//}
 
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
@@ -871,7 +871,7 @@ private:
     // Keep checkpoint-driven prompt batch boundaries even when partial state
     // cannot be stored losslessly. DSpark depends on the near-end boundaries,
     // while create_checkpoint() can independently suppress unsafe snapshots.
-    bool prompt_checkpoint_storage_lossless = true;
+    //bool prompt_checkpoint_storage_lossless = true;
 
     // slots / clients
     std::vector<server_slot> slots;
@@ -1159,12 +1159,12 @@ private:
             }
         }
 
-        const bool tgt_can_checkpoint = server_memory_can_checkpoint(ctx_tgt);
-        const bool dft_can_checkpoint = !ctx_dft || server_memory_can_checkpoint(ctx_dft);
-        prompt_checkpoint_storage_lossless = tgt_can_checkpoint && dft_can_checkpoint;
-        if (params_base.n_ctx_checkpoints > 0 && !prompt_checkpoint_storage_lossless) {
-            SRV_WRN("%s\n", "prompt checkpoint storage is not lossless for this context; snapshots will not be saved");
-        }
+        //const bool tgt_can_checkpoint = server_memory_can_checkpoint(ctx_tgt);
+        //const bool dft_can_checkpoint = !ctx_dft || server_memory_can_checkpoint(ctx_dft);
+        //prompt_checkpoint_storage_lossless = tgt_can_checkpoint && dft_can_checkpoint;
+        //if (params_base.n_ctx_checkpoints > 0 && !prompt_checkpoint_storage_lossless) {
+        //    SRV_WRN("%s\n", "prompt checkpoint storage is not lossless for this context; snapshots will not be saved");
+        //}
 
         if (llama_model_n_swa(model_tgt) == 0) {
             if (params_base.swa_full) {
@@ -1305,11 +1305,12 @@ private:
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
-        if (params_base.n_ctx_checkpoints > 0 && prompt_checkpoint_storage_lossless) {
+        //&& prompt_checkpoint_storage_lossless
+        if (params_base.n_ctx_checkpoints > 0 ) {
             SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
                     params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
-        } else if (params_base.n_ctx_checkpoints > 0) {
-            SRV_TRC("%s", "context checkpoint boundaries enabled, snapshot storage disabled\n");
+        //} else if (params_base.n_ctx_checkpoints > 0) {
+        //    SRV_TRC("%s", "context checkpoint boundaries enabled, snapshot storage disabled\n");
         } else {
             SRV_TRC("%s", "context checkpoints disabled\n");
         }
@@ -2234,9 +2235,9 @@ private:
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
-        if (!prompt_checkpoint_storage_lossless) {
-            return;
-        }
+        //if (!prompt_checkpoint_storage_lossless) {
+        //    return;
+        //}
 
         const int id_task = slot.task->id;
 
