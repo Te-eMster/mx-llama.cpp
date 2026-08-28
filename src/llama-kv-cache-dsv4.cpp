@@ -1492,11 +1492,11 @@ bool llama_kv_cache_dsv4::get_can_shift() const {
     return false;
 }
 
-bool llama_kv_cache_dsv4::get_can_checkpoint() const {
+//bool llama_kv_cache_dsv4::get_can_checkpoint() const {
     // The compressed attention state cannot currently be restored losslessly
     // from a partial sequence checkpoint.
-    return false;
-}
+//    return false;
+//}
 
 void llama_kv_cache_dsv4::clear(bool data) {
     kv_raw->clear(data);
