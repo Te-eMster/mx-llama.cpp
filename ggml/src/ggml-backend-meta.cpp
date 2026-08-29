@@ -1595,10 +1595,9 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         t_ij->flags = tensor->flags;
         memcpy(t_ij->op_params, tensor->op_params, sizeof(tensor->op_params));
 
-        // A row-sharded gather (see handle_get_rows) needs two scalars per device: the
-        // global row where this device's table slice starts, and the offset of its own
-        // block inside the shared index tensor. Both become pointer shifts at dispatch,
-        // so no gather kernel has to know about sharding. GET_ROWS carries no op_params
+        // A row-sharded gather (see handle_get_rows) needs the global row where this
+        // device's table slice starts. It becomes a pointer shift at dispatch, so no
+        // gather kernel has to know about sharding. GET_ROWS carries no op_params
         // otherwise, so zero is the unsharded path every other model takes.
         // Keyed on the SOURCE being sharded, not on the destination's axis: the gather
         // output is PARTIAL, so a dst-axis test never fires and the row offset would
@@ -1612,10 +1611,6 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                     for (size_t k = 0; k < j; k++) {
                         row_off += ss0.ne[s*n_simple_bufs + k]*ss0.nr[s];
                     }
-                }
-                int64_t idx_off = 0;
-                for (size_t k = 0; k < j; k++) {
-                    idx_off += split_state.ne[k]*split_state.nr[0];
                 }
                 GGML_ASSERT(row_off <= INT32_MAX);
                 t_ij->op_params[0] = (int32_t) row_off;

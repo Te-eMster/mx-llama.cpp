@@ -253,7 +253,6 @@ void launch_gated_delta_net_chunk(
     const int device = ggml_cuda_get_device();
     const int warp_size = ggml_cuda_info().devices[device].warp_size;
     const int cc = ggml_cuda_info().devices[device].cc;
-    const int CS = KDA ? 16 : 64;
     const int num_warps = cc == GGML_CUDA_CC_VEGA20 ? 2 : 4;
     dim3      block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
 

@@ -46,10 +46,12 @@
 #define cudaDeviceSynchronize musaDeviceSynchronize
 #define cudaError_t musaError_t
 #define cudaErrorMemoryAllocation musaErrorMemoryAllocation
+#define cudaErrorNotReady musaErrorNotReady
 #define cudaErrorPeerAccessAlreadyEnabled musaErrorPeerAccessAlreadyEnabled
 #define cudaErrorPeerAccessNotEnabled musaErrorPeerAccessNotEnabled
 #define cudaEventCreateWithFlags musaEventCreateWithFlags
 #define cudaEventDisableTiming musaEventDisableTiming
+#define cudaEventQuery musaEventQuery
 #define cudaEventRecord musaEventRecord
 #define cudaEventSynchronize musaEventSynchronize
 #define cudaEvent_t musaEvent_t
@@ -72,12 +74,14 @@
 #define cudaMallocManaged musaMallocManaged
 #define cudaMemcpy musaMemcpy
 #define cudaMemcpyAsync musaMemcpyAsync
+#define cudaMemcpyFromSymbol musaMemcpyFromSymbol
 #define cudaMemcpyPeerAsync musaMemcpyPeerAsync
 #define cudaMemcpy2DAsync musaMemcpy2DAsync
 #define cudaMemcpyDeviceToDevice musaMemcpyDeviceToDevice
 #define cudaMemcpyDeviceToHost musaMemcpyDeviceToHost
 #define cudaMemcpyHostToDevice musaMemcpyHostToDevice
 #define cudaMemcpyKind musaMemcpyKind
+#define cudaMemcpyToSymbol musaMemcpyToSymbol
 #define cudaMemset musaMemset
 #define cudaMemsetAsync musaMemsetAsync
 #define cudaMemGetInfo musaMemGetInfo
@@ -143,6 +147,7 @@
 #define cudaGraph_t musaGraph_t
 #define cudaKernelNodeParams musaKernelNodeParams
 #define cudaStreamCaptureModeRelaxed musaStreamCaptureModeRelaxed
+#define cudaStreamCaptureModeThreadLocal musaStreamCaptureModeThreadLocal
 #define cudaStreamBeginCapture musaStreamBeginCapture
 #define cudaStreamEndCapture musaStreamEndCapture
 #define cudaOccupancyMaxActiveBlocksPerMultiprocessor musaOccupancyMaxActiveBlocksPerMultiprocessor

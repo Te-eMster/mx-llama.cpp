@@ -266,7 +266,7 @@ static __global__ void k_get_rows_kq_n(
         const int i01 = i01g - row_lo;
         if (i01 < 0 || i01 >= n_rows) {
             for (int64_t i = threadIdx.x; i < ne00; i += blockDim.x) {
-                dst_row[i] = 0.0f;
+                dst_row[i] = ggml_cuda_cast<dst_t, float>(0.0f);
             }
             continue;
         }

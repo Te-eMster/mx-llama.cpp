@@ -215,18 +215,26 @@ static __global__ GGML_TOP_K_LAUNCH_BOUNDS(NT) void k_topk_small(const float * _
 
 #undef GGML_TOP_K_LAUNCH_BOUNDS
 
-// The candidate array is NT*K*8 bytes, so threads scale inversely with K to
-// hold it at 32 KB. k up to 64 covers the sampler default of 40 as well as the
-// smaller k a speculative drafter uses; above that the sort paths still win.
+// The candidate array is NT*K*8 bytes. Threads scale inversely with K to hold it at 32 KB, or 16 KB on MUSA to fit its per-block shared-memory limit.
+// k up to 64 covers the sampler default of 40 as well as the smaller k a speculative drafter uses. Above that the sort paths still win.
 static bool top_k_small_cuda(const float * src, int * dst, const int64_t ncols,
                              const int64_t nrows, const int64_t k, cudaStream_t stream) {
     const dim3 grid((unsigned) nrows, 1, 1);
+#if defined(GGML_USE_MUSA)
+    constexpr int nt_k16 = 128;
+    constexpr int nt_k32 =  64;
+    constexpr int nt_k64 =  32;
+#else
+    constexpr int nt_k16 = 256;
+    constexpr int nt_k32 = 128;
+    constexpr int nt_k64 =  64;
+#endif
     if (k <= 16) {
-        k_topk_small<16, 256><<<grid, 256, 0, stream>>>(src, dst, (int) ncols, (int) k);
+        k_topk_small<16, nt_k16><<<grid, nt_k16, 0, stream>>>(src, dst, (int) ncols, (int) k);
     } else if (k <= 32) {
-        k_topk_small<32, 128><<<grid, 128, 0, stream>>>(src, dst, (int) ncols, (int) k);
+        k_topk_small<32, nt_k32><<<grid, nt_k32, 0, stream>>>(src, dst, (int) ncols, (int) k);
     } else if (k <= 64) {
-        k_topk_small<64,  64><<<grid,  64, 0, stream>>>(src, dst, (int) ncols, (int) k);
+        k_topk_small<64, nt_k64><<<grid, nt_k64, 0, stream>>>(src, dst, (int) ncols, (int) k);
     } else {
         return false;
     }
