@@ -134,6 +134,31 @@ sounds on long prompts: 8x MI50 `-sm layer` with a 23k prompt, 182 to 759 t/s, a
 `-tps 4` generation 23.9 to 26.8 t/s. Three identical requests return identical
 output and identical draft acceptance.
 
+## Qwen3.8-Flash-Next tensor parallelism
+
+Qwen3.8-Flash-Next carries a PLE n-gram table - 27465 MiB on the UD-Q4_K_XL quant, larger at
+higher quants - that is otherwise host
+resident and demand paged, so every token pays a PCIe read to gather its rows and
+prefill is bound by that gather rather than by compute. `LLAMA_PLE_SHARD=1` splits
+the table by whole hash heads under `-sm tensor`, one segment owned per device, and
+get_rows zeroes the rows a device does not own so the partial vectors reduce through
+the existing AllReduce. On 4x MI50 with the UD-Q4_K_XL quant: 4096-token prefill 224
+to 500 t/s, 512-token generation 18 to 37 t/s, wiki perplexity 2.3108 to 2.3052
+(within error). The host staging copy is still retained after upload, so peak host
+memory is unchanged - this buys throughput, not footprint.
+
+The 103 GiB model does not fit alongside a 27 GiB gather table in host memory, so
+the loader maps lazily-read tensors even under `-lm dio`: the mapping is virtual,
+prefetch is zero and the range is never populated, which avoids whole-model mmap's
+page thrashing while still letting the table be demand paged.
+
+A NextN/MTP draft head is supported with `--spec-type draft-mtp`, converted by
+`convert_hf_to_gguf.py --mtp`. Draft acceptance runs 75-90 percent at `n_max 2` and
+is strongly text dependent (46 to 90 percent across prompts). Whether it is a net
+throughput win depends on the split mode - under `-sm tensor` the multi-GPU verify
+costs more than the drafting saves, while `-sm layer` lands near parity - so measure
+on your own topology before enabling it.
+
 ## Shared-expert tensor-parallel split
 
 Under `-sm tensor` the DeepSeek shared expert was mirrored: every lane read the

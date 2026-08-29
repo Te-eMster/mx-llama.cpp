@@ -962,6 +962,12 @@ typedef void (*dequantize_kernel_t)(const void * vx, const int64_t ib, const int
 template<typename dst_t>
 using dequantize_kq_t = void (*)(const void * vx, const int64_t ib, dst_t * y, const int tid);
 
+// Same, but bounded by how many 32-value sub-blocks of the super-block belong to the
+// row. Lets get_rows serve rows whose width is a multiple of the native block but not
+// of QK_K (qwen4exp PLE table: 160 = 5 x 32).
+template <typename dst_t>
+using dequantize_kq_n_t = void (*)(const void * vx, const int64_t ib, dst_t * y, const int tid, const int n_sub);
+
 static __device__ __forceinline__ float get_alibi_slope(
     const float max_bias, const uint32_t h, const uint32_t n_head_log2, const float m0, const float m1
 ) {

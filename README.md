@@ -11,12 +11,13 @@
 | | |
 |---|---|
 | **Multi-stage tensor parallelism** | `-tps T` groups the GPUs and pipelines layers across the groups |
-| **DeepSeek-V4-Flash on `-sm tensor`** | upstream keeps deepseek4 on the tensor-split unsupported list |
+| **DeepSeek-V4-Flash on `-sm tensor`** | fork routing kept after upstream's own split landed: GPU-side lightning indexer at any context length, static rollback topology |
+| **Qwen3.8-Flash-Next on `-sm tensor`** | PLE gather table sharded across the TP group (27 GiB on UD-Q4_K_XL, larger at higher quants), NextN/MTP draft head, lazy tensor read under `-lm dio` |
 | **Speculative decoding** | DSpark and DFlash under tensor parallelism, MTP KV staging |
 | **Custom GPU AllReduce** | peer-write, beats the RCCL ring for generation over PCIe |
 | **Q8_0 weight repack** ([iacopPBK](https://github.com/iacopPBK)) | GPU-side weight layout for gfx906, on by default |
 
-[FEATURES.md](FEATURES.md) - flags, measurements, scope. Base: upstream `b10589`.
+[FEATURES.md](FEATURES.md) - flags, measurements, scope. Base: upstream `b10679`.
 
 ---
 # llama.cpp

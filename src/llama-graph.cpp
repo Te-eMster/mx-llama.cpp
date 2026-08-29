@@ -1124,7 +1124,11 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    // A sub-context can hold no recurrent layers at all - an MTP draft context runs a
+    // single full-attention block, so the recurrent filter admits nothing and s_copy is
+    // created but never allocated. Nothing to copy then, so skip rather than dereference
+    // a tensor the allocator never backed.
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
@@ -1168,7 +1172,11 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    // A sub-context can hold no recurrent layers at all - an MTP draft context runs a
+    // single full-attention block, so the recurrent filter admits nothing and s_copy is
+    // created but never allocated. Nothing to copy then, so skip rather than dereference
+    // a tensor the allocator never backed.
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
@@ -1242,7 +1250,11 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    // A sub-context can hold no recurrent layers at all - an MTP draft context runs a
+    // single full-attention block, so the recurrent filter admits nothing and s_copy is
+    // created but never allocated. Nothing to copy then, so skip rather than dereference
+    // a tensor the allocator never backed.
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 

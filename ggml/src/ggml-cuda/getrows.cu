@@ -232,6 +232,83 @@ static void get_rows_cuda_kq(
         s10, s11, s12/*, s13*/);
 }
 
+// get_rows for rows that are a whole number of native 32-value blocks but not a whole
+// number of QK_K super-blocks. The last super-block of each row is partial and the
+// dequantizer is told how many sub-blocks of it are real.
+template<typename dst_t, dequantize_kq_n_t<dst_t> dequantize_kq_n, int sub_per_sb>
+static __global__ void k_get_rows_kq_n(
+        const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
+        const int64_t ne00, /*const int64_t ne01, const int64_t ne02, const int64_t ne03,*/
+        /*const int64_t ne10,*/ const int64_t ne11, const uint3 ne12_fdv, /*const int64_t ne13,*/
+        /*const size_t s0,*/ const size_t s1, const size_t s2, const size_t s3,
+        /*const size_t nb00,*/ const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12,/*const size_t s13,*/
+        const int64_t row_lo, const int64_t n_rows) {
+
+    ggml_cuda_pdl_sync();
+
+    const int64_t n_sub_row = ne00/(QK_K/sub_per_sb);      // native blocks in a row
+    const int64_t nsb       = (n_sub_row + sub_per_sb - 1)/sub_per_sb; // super-blocks, last may be partial
+
+    for (int64_t z = blockIdx.z; z < ne11*(int64_t)ne12_fdv.z; z += gridDim.z) {
+        const int i10 = blockIdx.x;
+        const uint2 dm  = fast_div_modulo((uint32_t)z, ne12_fdv);
+        const int i11 = dm.x;
+        const int i12 = dm.y;
+
+        const int i01g = src1[i10*s10 + i11*s11 + i12*s12];
+
+        dst_t * dst_row = dst + i10*s1 + i11*s2 + i12*s3;
+
+        // Sharded table: indices stay global while this device holds only
+        // [row_lo, row_lo+n_rows). Rows owned by another device contribute zero, so
+        // the per-device results sum to the whole gather under the reduce.
+        const int i01 = i01g - row_lo;
+        if (i01 < 0 || i01 >= n_rows) {
+            for (int64_t i = threadIdx.x; i < ne00; i += blockDim.x) {
+                dst_row[i] = 0.0f;
+            }
+            continue;
+        }
+
+        const void * src0_row = (const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03;
+
+        for (int64_t ib = blockIdx.y; ib < nsb; ib += gridDim.y) {
+            const int n_sub = (int) MIN((int64_t) sub_per_sb, n_sub_row - ib*sub_per_sb);
+            dequantize_kq_n(src0_row, ib, dst_row + ib*QK_K, threadIdx.x, n_sub);
+        }
+    }
+}
+
+template<int block_dim, typename dst_t, dequantize_kq_n_t<dst_t> dequantize_kq_n, int sub_per_sb>
+static void get_rows_cuda_kq_n(
+        const void * src0_d, const int32_t * src1_d, dst_t * dst_d,
+        const int64_t ne00, const size_t nb01, const size_t nb02, const size_t nb03,
+        const int64_t ne10, const int64_t ne11, const int64_t ne12, const size_t nb10, const size_t nb11, const size_t nb12,
+        const size_t nb1, const size_t nb2, const size_t nb3,
+        cudaStream_t stream, const int64_t row_lo = 0, const int64_t n_rows = 0) {
+    const int64_t blk = QK_K/sub_per_sb;              // native block size, 32
+    GGML_ASSERT(ne00 % blk == 0);
+    const int64_t n_sub_row = ne00/blk;
+    const int64_t nsb       = (n_sub_row + sub_per_sb - 1)/sub_per_sb;
+
+    const dim3 block_dims(block_dim, 1, 1);
+    const dim3 block_nums(ne10, MIN(nsb, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
+
+    const size_t s1 = nb1 / sizeof(dst_t);
+    const size_t s2 = nb2 / sizeof(dst_t);
+    const size_t s3 = nb3 / sizeof(dst_t);
+    const size_t s10 = nb10 / sizeof(int32_t);
+    const size_t s11 = nb11 / sizeof(int32_t);
+    const size_t s12 = nb12 / sizeof(int32_t);
+
+    const uint3 ne12_fdv = init_fastdiv_values(ne12);
+
+    k_get_rows_kq_n<dst_t, dequantize_kq_n, sub_per_sb><<<block_nums, block_dims, 0, stream>>>(
+        src0_d, src1_d, dst_d, ne00, ne11, ne12_fdv, s1, s2, s3, nb01, nb02, nb03, s10, s11, s12,
+        row_lo, n_rows);
+}
+
 template<typename src0_t, typename dst_t>
 static void get_rows_cuda_float(
         const src0_t * src0_d, const int32_t * src1_d, dst_t * dst_d,
@@ -300,7 +377,7 @@ static void ggml_cuda_get_rows_switch_src0_type(
         const int64_t ne00, const size_t nb01, const size_t nb02, const size_t nb03,
         const int64_t ne10, const int64_t ne11, const int64_t ne12, const size_t nb10, const size_t nb11, const size_t nb12,
         const size_t nb1, const size_t nb2, const size_t nb3,
-        cudaStream_t stream) {
+        cudaStream_t stream, const int64_t row_lo = 0, const int64_t n_rows = 0) {
     switch (src0_type) {
         case GGML_TYPE_F16:
             get_rows_cuda_float((const half *) src0_d, src1_d, dst_d,
@@ -395,16 +472,30 @@ static void ggml_cuda_get_rows_switch_src0_type(
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_IQ4_NL:
-            get_rows_cuda_kq<32, dst_t, dequantize_iq4_nl<dst_t>>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            // A row that is whole 32-value blocks but not whole QK_K super-blocks takes
+            // the bounded path (qwen4exp's 160-wide PLE gather table).
+            if (ne00 % QK_K == 0) {
+                get_rows_cuda_kq<32, dst_t, dequantize_iq4_nl<dst_t>>(src0_d, src1_d, dst_d,
+                    ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            } else {
+                get_rows_cuda_kq_n<32, dst_t, dequantize_iq4_nl_n<dst_t>, QK_K/QK4_NL>(src0_d, src1_d, dst_d,
+                    ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream,
+                    row_lo, n_rows);
+            }
             break;
         case GGML_TYPE_IQ4_XS:
             get_rows_cuda_kq<32, dst_t, dequantize_iq4_xs<dst_t>>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_MXFP4:
-            get_rows_cuda_kq<32, dst_t, dequantize_mxfp4<dst_t>>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            if (ne00 % QK_K == 0) {
+                get_rows_cuda_kq<32, dst_t, dequantize_mxfp4<dst_t>>(src0_d, src1_d, dst_d,
+                    ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            } else {
+                get_rows_cuda_kq_n<32, dst_t, dequantize_mxfp4_n<dst_t>, QK_K/QK_MXFP4>(src0_d, src1_d, dst_d,
+                    ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream,
+                    row_lo, n_rows);
+            }
             break;
         default:
             GGML_ABORT("%s: unsupported src0 type: %s\n", __func__, ggml_type_name(src0_type));
@@ -417,23 +508,23 @@ void get_rows_cuda(
         int64_t ne00, size_t nb01, size_t nb02, size_t nb03,
         int64_t ne10, int64_t ne11, int64_t ne12, size_t nb10, size_t nb11, size_t nb12,
         size_t nb1, size_t nb2, size_t nb3,
-        cudaStream_t stream) {
+        cudaStream_t stream, int64_t row_lo, int64_t n_rows) {
     switch (dst_type) {
         case GGML_TYPE_F32:
             ggml_cuda_get_rows_switch_src0_type(src0_d, src0_type, src1_d, (float *) dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream, row_lo, n_rows);
             break;
         case GGML_TYPE_I32:
             ggml_cuda_get_rows_switch_src0_type(src0_d, src0_type, src1_d, (int32_t *) dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream, row_lo, n_rows);
             break;
         case GGML_TYPE_F16:
             ggml_cuda_get_rows_switch_src0_type(src0_d, src0_type, src1_d, (half *) dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream, row_lo, n_rows);
             break;
         case GGML_TYPE_BF16:
             ggml_cuda_get_rows_switch_src0_type(src0_d, src0_type, src1_d, (nv_bfloat16 *) dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream, row_lo, n_rows);
             break;
         default:
             GGML_ABORT("%s: unsupported dst type: %s\n", __func__, ggml_type_name(dst_type));
@@ -466,8 +557,13 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             std::vector<int32_t> idx(n_idx);
             CUDA_CHECK(cudaMemcpyAsync(idx.data(), src1->data, n_idx*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
             CUDA_CHECK(cudaStreamSynchronize(stream));
-            for (int64_t i = 0; i < n_idx; ++i) {
-                if (idx[i] < 0 || idx[i] >= src0->ne[1]) {
+            // indices stay global while a sharded src0 holds only [row_lo, row_lo+ne1),
+            // and only this device's block of the mirrored index tensor belongs to it
+            const int32_t row_lo  = dst->op_params[0];
+            const int64_t idx_lo  = dst->op_params[1];
+            const int64_t idx_hi  = MIN(n_idx, idx_lo + dst->ne[1]);
+            for (int64_t i = idx_lo; i < idx_hi; ++i) {
+                if (idx[i] < row_lo || idx[i] >= row_lo + src0->ne[1]) {
                     GGML_LOG_ERROR("get_rows OOB: dst=%s src0=%s [%ld x %ld] src1=%s idx[%ld] = %d\n",
                             dst->name, src0->name, src0->ne[0], src0->ne[1], src1->name, i, idx[i]);
                 }
@@ -475,8 +571,20 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         }
     }
 
+    // Sharded gather table (qwen4exp's PLE memory under -sm tensor). This device holds
+    // table rows [row_lo, row_lo + ne01). Every device sees every index and keeps only
+    // the rows it owns, writing zeros for the rest, so the per-device results sum to
+    // the whole gather under the reduce that follows. The split therefore sits on the
+    // TABLE rows, not on the output rows - which is what lets it coexist with
+    // upstream's token-major index layout, where a head's rows are strided and no
+    // contiguous split of the output could follow them.
+    // n_rows == 0 disables the mask, which is every unsharded gather.
+    const int64_t shard_row_lo = dst->op_params[0];
+    const int64_t shard_n_rows = dst->op_params[1] ? src0->ne[1] : 0;
+
     get_rows_cuda(src0->data, src0->type, (const int32_t *) src1->data, dst->data, dst->type,
-        ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+        ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream,
+        shard_row_lo, shard_n_rows);
 }
 
 void ggml_cuda_op_get_rows_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

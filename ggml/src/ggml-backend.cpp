@@ -184,6 +184,8 @@ void ggml_backend_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backe
     // FIXME: add a generic callback to the buffer interface
     if (ggml_backend_buffer_is_multi_buffer(buffer)) {
         ggml_backend_multi_buffer_set_usage(buffer, usage);
+    } else if (ggml_backend_buffer_is_meta(buffer)) {
+        ggml_backend_meta_buffer_set_usage(buffer, usage);
     }
 }
 
@@ -551,7 +553,9 @@ void ggml_backend_event_synchronize(ggml_backend_event_t event) {
     event->device->iface.event_synchronize(event->device, event);
 }
 
-bool ggml_backend_event_query(ggml_backend_event_t event) {
+GGML_API bool ggml_backend_event_query(ggml_backend_event_t event);
+
+GGML_API bool ggml_backend_event_query(ggml_backend_event_t event) {
     GGML_ASSERT(event);
 
     if (event->device->iface.event_query == NULL) {

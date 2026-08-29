@@ -110,11 +110,19 @@ static __global__ void k_topk_remap(
 
 // Direct top-k for small k: one block per row, one pass over the row.
 // Each thread keeps a descending top-K list in registers; the insertion is an
-// unrolled compare-swap cascade so every index stays compile-time and nothing
-// spills. The block then extracts k winners by repeated block-wide argmax.
-// Ties go to the lower index, which is what the argsort path produces.
+// unrolled compare-swap cascade so every index stays compile-time. The HIP
+// launch bound keeps the K=64 candidate state out of scratch while leaving
+// CUDA launch metadata unchanged. The block then extracts k winners by
+// repeated block-wide argmax. Ties go to the lower index, which is what the
+// argsort path produces.
+#if defined(GGML_USE_HIP)
+#define GGML_TOP_K_LAUNCH_BOUNDS(n) __launch_bounds__(n)
+#else
+#define GGML_TOP_K_LAUNCH_BOUNDS(n)
+#endif
+
 template <int K, int NT>
-static __global__ void k_topk_small(const float * __restrict__ x, int * __restrict__ dst,
+static __global__ GGML_TOP_K_LAUNCH_BOUNDS(NT) void k_topk_small(const float * __restrict__ x, int * __restrict__ dst,
                                     const int ncols, const int k) {
     const int row = blockIdx.x;
     const float * __restrict__ xr = x + (size_t) row * ncols;
@@ -204,6 +212,8 @@ static __global__ void k_topk_small(const float * __restrict__ x, int * __restri
         __syncthreads();
     }
 }
+
+#undef GGML_TOP_K_LAUNCH_BOUNDS
 
 // The candidate array is NT*K*8 bytes, so threads scale inversely with K to
 // hold it at 32 KB. k up to 64 covers the sampler default of 40 as well as the

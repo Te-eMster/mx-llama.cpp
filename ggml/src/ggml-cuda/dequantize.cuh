@@ -404,13 +404,20 @@ static __device__ __forceinline__ void dequantize_iq1_m(const void * vx, const i
     }
 }
 
+// n_sub bounds how many 32-value sub-blocks of this super-block are actually part of
+// the row. It is QK_K/QK4_NL for a whole super-block, and less for the tail of a row
+// whose width is a multiple of QK4_NL but not of QK_K - qwen4exp's 160-wide PLE
+// gather table is exactly that case.
 template<typename dst_t>
-static __device__ __forceinline__ void dequantize_iq4_nl(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
+static __device__ __forceinline__ void dequantize_iq4_nl_n(const void * vx, const int64_t ibs, dst_t * yy, const int tid, const int n_sub) {
 
     const block_iq4_nl * x = (const block_iq4_nl *) vx + ibs*(QK_K/QK4_NL);
 
     const int64_t il = tid/8; // 0...3
     const int64_t ib = tid%8; // 0...7
+    if (ib >= n_sub) {
+        return;
+    }
     dst_t * y = yy + 32*ib + 4*il;
     const uint8_t  * q4 = x[ib].qs + 4*il;
     const float d = (float)x[ib].d;
@@ -418,6 +425,11 @@ static __device__ __forceinline__ void dequantize_iq4_nl(const void * vx, const 
         y[j+ 0] = ggml_cuda_cast<dst_t>(d * kvalues_iq4nl[q4[j] & 0xf]);
         y[j+16] = ggml_cuda_cast<dst_t>(d * kvalues_iq4nl[q4[j] >>  4]);
     }
+}
+
+template<typename dst_t>
+static __device__ __forceinline__ void dequantize_iq4_nl(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
+    dequantize_iq4_nl_n<dst_t>(vx, ibs, yy, tid, QK_K/QK4_NL);
 }
 
 template<typename dst_t>
@@ -436,12 +448,15 @@ static __device__ __forceinline__ void dequantize_iq4_xs(const void * vx, const 
 }
 
 template<typename dst_t>
-static __device__ __forceinline__ void dequantize_mxfp4(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
+static __device__ __forceinline__ void dequantize_mxfp4_n(const void * vx, const int64_t ibs, dst_t * yy, const int tid, const int n_sub) {
 
     const block_mxfp4 * x = (const block_mxfp4 *) vx + ibs*(QK_K/QK_MXFP4);
 
     const int64_t il = tid/8; // 0...3
     const int64_t ib = tid%8; // 0...7
+    if (ib >= n_sub) {
+        return;
+    }
     dst_t * y = yy + 32*ib + 4*il;
     const uint8_t  * q4 = x[ib].qs + 4*il;
     const float d = ggml_cuda_e8m0_to_fp32(x[ib].e);
@@ -449,4 +464,9 @@ static __device__ __forceinline__ void dequantize_mxfp4(const void * vx, const i
         y[j+ 0] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q4[j] & 0xf]*0.5f);
         y[j+16] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q4[j] >>  4]*0.5f);
     }
+}
+
+template<typename dst_t>
+static __device__ __forceinline__ void dequantize_mxfp4(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
+    dequantize_mxfp4_n<dst_t>(vx, ibs, yy, tid, QK_K/QK_MXFP4);
 }

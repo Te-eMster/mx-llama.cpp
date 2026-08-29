@@ -2,7 +2,7 @@
 #include "ggml-impl.h"
 #include "ggml-backend.h"
 
-#if defined(__linux__)
+#if defined(__linux__) && !defined(__ANDROID__)
 #include <execinfo.h>
 #endif
 #include "ggml-backend-impl.h"
@@ -203,6 +203,16 @@ static void ggml_backend_meta_device_event_synchronize(ggml_backend_dev_t /*dev*
     }
 }
 
+static bool ggml_backend_meta_device_event_query(ggml_backend_dev_t /*dev*/, ggml_backend_event_t event) {
+    auto * ev_ctx = (ggml_backend_meta_event_context *) event->context;
+    for (ggml_backend_event_t e : ev_ctx->simple_events) {
+        if (e->device->iface.event_query != nullptr && !e->device->iface.event_query(e->device, e)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static ggml_backend_t ggml_backend_meta_device_init_backend(ggml_backend_dev_t dev, const char * params);
 
 static ggml_backend_buffer_type_t ggml_backend_meta_device_get_buffer_type(ggml_backend_dev_t dev);
@@ -346,6 +356,7 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
     /* .event_new            = */ ggml_backend_meta_device_event_new,
     /* .event_free           = */ ggml_backend_meta_device_event_free,
     /* .event_synchronize    = */ ggml_backend_meta_device_event_synchronize,
+    /* .event_query          = */ ggml_backend_meta_device_event_query,
 };
 
 static bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev) {
@@ -905,6 +916,19 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 if (src_ss[0].n_segments == 1) {
                     base_ne_in /= src_ss[0].nr[0];
                     if (src_ss[0].axis == ggml_n_dims(tensor->src[0]) - 1 && src_ss[0].nr[0] == 1) {
+                        // A fold of the split trailing dim INTO dim 0 moves the split to dim 0.
+                        // qwen4exp's PLE gather is [head_dim, n_heads*n_tokens] split by head
+                        // group, reshaped to [head_dim*n_heads, n_tokens]: a device owning 4 of
+                        // 16 heads owns 640 of the 2560 wide vector, not 4 of the tokens. Keeping
+                        // the split on the last dim makes the ratio below indivisible.
+                        const int64_t src_last = tensor->src[0]->ne[src_ss[0].axis];
+                        const int64_t dst_last = tensor->ne[ggml_n_dims(tensor) - 1];
+                        if (dst_last > 0 && src_last > dst_last && src_last % dst_last == 0) {
+                            const int64_t fold = src_last / dst_last;
+                            if (tensor->ne[0] == tensor->src[0]->ne[0] * fold) {
+                                return {GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1};
+                            }
+                        }
                         return {ggml_backend_meta_split_axis(ggml_n_dims(tensor) - 1), {0}, {1}, 1};
                     }
                     if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && tensor->ne[0] == tensor->src[0]->ne[0] &&
@@ -1031,6 +1055,17 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     auto handle_get_rows = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return src_ss[0];
+        }
+        // Row-sharded gather table. src0 carries one segment per lookup head, each
+        // owned whole by one device, but a token needs EVERY head, so each device
+        // gathers the rows it owns and zeros the rows it does not. The results are
+        // therefore partial sums of the whole gather. Returning PARTIAL hands them to
+        // the backend's existing reduction, which leaves the consumer graph exactly as
+        // upstream wrote it - no all-gather primitive is needed, and there is none.
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1 &&
+                src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL,
+                    {0}, {1}, 1};
         }
         return handle_generic(src_ss, /*scalar_only =*/ true);
     };
@@ -1357,7 +1392,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 split_state = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
             } break;
         }
-        if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
+        // handle_get_rows works out a row-sharded gather's output split exactly, from
+        // which device owns which lookup head. The proportional derivation below would
+        // overwrite that with a ratio taken from the TABLE's row split, which is not
+        // what a gather does: the output size follows head ownership, not row counts.
+        const bool ne_set_by_rule = tensor->op == GGML_OP_GET_ROWS &&
+                split_state.axis == GGML_BACKEND_SPLIT_AXIS_1 &&
+                src_ss[0].axis  == GGML_BACKEND_SPLIT_AXIS_1;
+
+        if (!ne_set_by_rule && split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
             bool first_src_split_by_axis = true;
             const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
 
@@ -1377,6 +1420,17 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                         split_state.ne[j] *= tensor->ne[split_state.axis];
                         if (split_state.ne[j] != 0 || tensor->src[i]->ne[src_ss[i].axis] != 0) {
                             const int64_t div = tensor->src[i]->ne[src_ss[i].axis] * split_state.nr[0];
+                            if (div == 0 || split_state.ne[j] % div != 0) {
+                                GGML_LOG_ERROR("%s: node '%s' (op %s) out axis %s: ne[%zu]=%lld not divisible "
+                                        "by %lld -- src%zu '%s' axis %s ne=%lld, out ne=%lld\n", __func__,
+                                        tensor->name, ggml_op_name(tensor->op),
+                                        ggml_backend_meta_split_axis_name(split_state.axis),
+                                        j, (long long) split_state.ne[j], (long long) div, i,
+                                        tensor->src[i]->name,
+                                        ggml_backend_meta_split_axis_name(src_ss[i].axis),
+                                        (long long) tensor->src[i]->ne[src_ss[i].axis],
+                                        (long long) tensor->ne[split_state.axis]);
+                            }
                             GGML_ASSERT(split_state.ne[j] % div == 0);
                             split_state.ne[j] /= div;
                         }
@@ -1474,6 +1528,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
 }
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync) {
+    if (tensor->buffer == nullptr || !ggml_backend_buffer_is_meta(tensor->buffer)) {
+        // name the tensor rather than aborting on a bare line number - this fires under
+        // -tps when a node ends up outside the meta buffer
+        GGML_LOG_ERROR("%s: tensor '%s' (op %s) is not in a meta buffer, it is in '%s'\n",
+                __func__, tensor->name, ggml_op_name(tensor->op),
+                tensor->buffer ? ggml_backend_buffer_name(tensor->buffer) : "(null)");
+    }
     GGML_ASSERT(ggml_backend_buffer_is_meta(tensor->buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
     return ggml_backend_meta_get_split_state(buf_ctx->get_simple_tensor_container(tensor), tensor, assume_sync);
@@ -1533,6 +1594,34 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         }
         t_ij->flags = tensor->flags;
         memcpy(t_ij->op_params, tensor->op_params, sizeof(tensor->op_params));
+
+        // A row-sharded gather (see handle_get_rows) needs two scalars per device: the
+        // global row where this device's table slice starts, and the offset of its own
+        // block inside the shared index tensor. Both become pointer shifts at dispatch,
+        // so no gather kernel has to know about sharding. GET_ROWS carries no op_params
+        // otherwise, so zero is the unsharded path every other model takes.
+        // Keyed on the SOURCE being sharded, not on the destination's axis: the gather
+        // output is PARTIAL, so a dst-axis test never fires and the row offset would
+        // silently stay 0 - every device then keeps only device 0's rows.
+        if (tensor->op == GGML_OP_GET_ROWS && tensor->src[0] != nullptr) {
+            const ggml_backend_meta_split_state ss0 =
+                ggml_backend_meta_get_split_state(tensor->src[0], /*assume_sync =*/ true);
+            if (ss0.axis == GGML_BACKEND_SPLIT_AXIS_1) {
+                int64_t row_off = 0;
+                for (size_t s = 0; s < ss0.n_segments; s++) {
+                    for (size_t k = 0; k < j; k++) {
+                        row_off += ss0.ne[s*n_simple_bufs + k]*ss0.nr[s];
+                    }
+                }
+                int64_t idx_off = 0;
+                for (size_t k = 0; k < j; k++) {
+                    idx_off += split_state.ne[k]*split_state.nr[0];
+                }
+                GGML_ASSERT(row_off <= INT32_MAX);
+                t_ij->op_params[0] = (int32_t) row_off;
+                t_ij->op_params[1] = 1;   // flag: this gather is sharded, enable the mask
+            }
+        }
         ggml_set_name(t_ij, tensor->name);
         t_ij->buffer = simple_buf;
         t_ij->view_src = tensor->view_src;
@@ -1565,7 +1654,14 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
             t_ij->data = (char *) ggml_backend_buffer_get_base(simple_buf)
                 + size_t(tensor->data) - size_t(ggml_backend_buffer_get_base(tensor->buffer));
         }
-        t_ij->extra = tensor->extra;
+
+        if (simple_buf) {
+            // the backend that owns the buffer will set .extra
+            ggml_backend_buffer_init_tensor(simple_buf, t_ij);
+        } else {
+            t_ij->extra = tensor->extra;
+        }
+
         for (int i = 0; i < GGML_MAX_SRC; i++) {
             t_ij->src[i] = tensor->src[i];
             if (tensor->src[i] == tensor) {
@@ -1971,6 +2067,16 @@ static const ggml_backend_buffer_i ggml_backend_meta_buffer_iface = {
 
 bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf) {
     return buf != nullptr && buf->iface.free_buffer == ggml_backend_meta_buffer_iface.free_buffer;
+}
+
+void ggml_backend_meta_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage) {
+    GGML_ASSERT(ggml_backend_buffer_is_meta(buffer));
+    ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
+    for (size_t i = 0; i < buf_ctx->bufs.size(); i++) {
+        if (buf_ctx->bufs[i]) {
+            ggml_backend_buffer_set_usage(buf_ctx->bufs[i].get(), usage);
+        }
+    }
 }
 
 static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
@@ -3020,7 +3126,7 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
         }
         const double waited = ggml_time_us()/1000.0 - t0;
         fprintf(stderr, "[chunk] sync  t=%9.3f ms waited=%.3f ms\n", t0, waited);
-#if defined(__linux__)
+#if defined(__linux__) && !defined(__ANDROID__)
         // name the caller of any expensive drain - every extern frame
         // symbolizes, which is enough to attribute the wait
         if (waited > 50.0) {

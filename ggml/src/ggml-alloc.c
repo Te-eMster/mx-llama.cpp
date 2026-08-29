@@ -522,16 +522,8 @@ struct ggml_gallocr {
     struct gallocr_layout layouts[GGML_GALLOC_MAX_LAYOUTS];
     int64_t layout_uses;
     uint64_t active_key_ids; // buffer-id checksum of the active layout (0 = unknown)
+    bool layout_cache_enabled;
 };
-
-static bool ggml_gallocr_layout_cache_enabled(void) {
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char * env = getenv("GGML_GALLOC_LAYOUT_CACHE");
-        enabled = env == NULL || atoi(env) != 0;
-    }
-    return enabled != 0;
-}
 
 static uint64_t ggml_gallocr_graph_tensor_ordinal(
         const struct ggml_hash_set * tensors, const uint64_t * ordinals, const struct ggml_tensor * tensor) {
@@ -627,6 +619,9 @@ static bool ggml_gallocr_layout_restore(ggml_gallocr_t galloc, struct ggml_cgrap
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
     ggml_gallocr_t galloc = (ggml_gallocr_t)calloc(1, sizeof(struct ggml_gallocr));
     GGML_ASSERT(galloc != NULL);
+
+    const char * layout_cache_env = getenv("GGML_GALLOC_LAYOUT_CACHE");
+    galloc->layout_cache_enabled = layout_cache_env == NULL || atoi(layout_cache_env) != 0;
 
     galloc->bufts = calloc(n_bufs, sizeof(ggml_backend_buffer_type_t));
     GGML_ASSERT(galloc->bufts != NULL);
@@ -1223,7 +1218,7 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 // the buffer-id assignment it was reserved with - same-topology graphs with
 // different assignments (multi-buffer schedulers) get separate slots
 static void ggml_gallocr_layout_store(ggml_gallocr_t galloc, uint64_t key, uint64_t key_ids) {
-    if (!ggml_gallocr_layout_cache_enabled() || key == 0) {
+    if (!galloc->layout_cache_enabled || key == 0) {
         return;
     }
     galloc->active_key_ids = key_ids;
@@ -1313,7 +1308,7 @@ static void ggml_gallocr_layout_store(ggml_gallocr_t galloc, uint64_t key, uint6
 // becomes the active allocation and no reserve (hence no scheduler drain)
 // is needed
 static bool ggml_gallocr_layout_restore(ggml_gallocr_t galloc, struct ggml_cgraph * graph, uint64_t key_ids) {
-    if (!ggml_gallocr_layout_cache_enabled()) {
+    if (!galloc->layout_cache_enabled) {
         return false;
     }
 

@@ -16,6 +16,7 @@
 #include "llama-kv-cache-dsv4.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
+#include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
 
 #include "llama.h"
@@ -319,6 +320,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_qwen35(params);
         case LLM_ARCH_QWEN35MOE:
             return new llama_model_qwen35moe(params);
+        case LLM_ARCH_QWEN4EXP:
+            return new llama_model_qwen4exp(params);
         case LLM_ARCH_MISTRAL3:
             return new llama_model_mistral3(params);
         case LLM_ARCH_EAGLE3:
@@ -361,6 +364,22 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
     return llama_model_create(arch, params);
 }
 
+// PLE gather table VRAM shard, opt in with LLAMA_PLE_SHARD=1. Upstream's default is
+// a host resident, demand paged table: no VRAM, one PCIe read per token. The shard
+// splits the table across the TP group instead so the gather is local. Only -sm
+// tensor can split, so this does nothing in the other split modes.
+static bool llama_ple_shard_enabled() {
+    static const bool enabled = [] {
+        const char * s = getenv("LLAMA_PLE_SHARD");
+        const bool on = s != nullptr && atoi(s) != 0;
+        if (on) {
+            LLAMA_LOG_WARN("%s: LLAMA_PLE_SHARD=1, sharding the PLE gather table across the TP group\n", __func__);
+        }
+        return on;
+    }();
+    return enabled;
+}
+
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
@@ -376,6 +395,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_qkv_bias        ("blk\\.\\d*\\.attn_qkv.bias");
     static const std::regex pattern_qk_norm         ("blk\\.\\d*\\.attn_(q|k)_norm\\.weight");
     static const std::regex pattern_kv_cache        ("cache_(k|v)_l\\d*");
+    static const std::regex pattern_idx_cache       ("cache_idx_(k|v)_l\\d*");
+    // upstream also declares pattern_dsv4_state here and uses it in its own
+    // is_dsv4 block. This fork routes DSV4 through the design-B head-split path
+    // and never matches on it, so the declaration is deliberately not carried -
+    // do not re-add it on the next bump.
     static const std::regex pattern_attn_sinks      ("blk\\.\\d*\\.attn_sinks.weight");
     static const std::regex pattern_attn_out_weight ("blk\\.\\d*\\.attn_output.weight");
     static const std::regex pattern_attn_out_bias   ("blk\\.\\d*\\.attn_output.bias");
@@ -394,6 +418,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_ssm_beta        ("blk\\.\\d*\\.ssm_beta.weight");
     static const std::regex pattern_ssm_beta_alpha  ("blk\\.\\d*\\.ssm_ba.weight");
     static const std::regex pattern_r_cache         ("cache_r_l\\d*");
+    static const std::regex pattern_ple_r_cache     ("cache_ple_r_l\\d*");
     static const std::regex pattern_s_cache         ("cache_s_l\\d*");
     static const std::regex pattern_ssm_conv1d      ("blk\\.\\d*\\.ssm_conv1d.weight");
     static const std::regex pattern_ssm_out_weight  ("blk\\.\\d*\\.ssm_out.weight");
@@ -454,6 +479,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
         const ggml_tensor * tensor_axis_0 = suffix.empty() ? tensor : ud->model->get_tensor((prefix + suffix).c_str());
         if (tensor_axis_0 == nullptr) {
+            if (suffix_fallback.empty()) {
+                LLAMA_LOG_ERROR("%s: split-state lookup FAILED: tensor [%s] wanted sibling [%s%s] n_layer=%u nextn=%u ",
+                        __func__, tensor_name.c_str(), prefix.c_str(), suffix.c_str(),
+                        ud->model->hparams.n_layer(), ud->model->hparams.n_layer_nextn);
+            }
             GGML_ASSERT(!suffix_fallback.empty());
             tensor_axis_0 = ud->model->get_tensor((prefix + suffix_fallback).c_str());
         }
@@ -541,6 +571,33 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     }
 
     auto get_tensor_config = [&]() -> tensor_config {
+        // The MTP draft block sits one block past the trunk and is loaded as its own
+        // model on a single device, yet it inherits the target's split mode and so
+        // still passes through here. Mirror it whole. Two reasons: its tensor set is
+        // not a trunk layer's, so the sibling lookups the rules below rely on would
+        // miss and abort on an empty fallback, and splitting a head that folds a
+        // 4-branch residual would allreduce a 10240-wide vector per drafted token.
+        if (ud->model->hparams.n_layer_nextn > 0) {
+            // A block index reaches here in two spellings: weights as blk.<il>.<name>
+            // and cache entries as cache_{k,v}_l<il>. Both must be mirrored for the MTP
+            // block, or a KV write ends up with src0 and src2 carrying different splits.
+            long il_blk = -1;
+            if (tensor_name.compare(0, 4, "blk.") == 0) {
+                const size_t dot = tensor_name.find('.', 4);
+                if (dot != std::string::npos) {
+                    il_blk = std::stol(tensor_name.substr(4, dot - 4));
+                }
+            } else if (tensor_name.compare(0, 6, "cache_") == 0) {
+                const size_t lpos = tensor_name.find("_l", 6);
+                if (lpos != std::string::npos) {
+                    il_blk = std::stol(tensor_name.substr(lpos + 2));
+                }
+            }
+            if (il_blk >= (long) ud->model->hparams.n_layer()) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+        }
+
         // Vocabulary-parallel logits are incompatible with any vocabulary-global op run
         // inside the graph. The DSpark draft head is exactly that: it chains
         // argmax(logits) -> get_rows(markov_w1) -> mul_mat(markov_w2) once per drafted
@@ -650,6 +707,17 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
             // else fall through to the FFN / output patterns below
         }
+
+        // the qsa indexer has one key head and its projections are mirrored, so its cache cannot be split
+        if (std::regex_match(tensor_name, pattern_idx_cache)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+
+        // the PLE table is model-level and its conv is mirrored, so every device runs the whole conv and needs the whole history
+        if (std::regex_match(tensor_name, pattern_ple_r_cache)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+
         // standard attention
         if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
@@ -744,12 +812,23 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
         }
 
+        if (llama_ple_shard_enabled()) {
+            // Split the PLE table along its ROW axis so each device owns a contiguous
+            // range of the gather rows. The key/value projections that consume the
+            // gathered vector need no rule of their own - the partial gathers are
+            // reduced back to a full mirrored vector before those projections read it.
+            if (tensor_name == "per_layer_token_embd.weight") {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
+            }
+        }
+
         // everything else
         return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
     };
 
     auto get_split_segments = [&](int axis, uint32_t il) -> std::vector<std::pair<int64_t, uint32_t>> {
-        if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE) {
+        if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE ||
+                ud->model->arch == LLM_ARCH_QWEN4EXP) {
             const int64_t head_k_dim = hparams.ssm_d_state;
             const int64_t head_v_dim = hparams.ssm_d_state;
             const int64_t n_k_heads  = hparams.ssm_n_group;
@@ -887,7 +966,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_q_bias)) {
                 GGML_ASSERT(segments.size() == 1);
                 // some models have Q gate tensors, for those cases the granularity needs to be doubled:
-                if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE) {
+                if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE ||
+                        ud->model->arch == LLM_ARCH_QWEN4EXP) {
                     return {std::lcm(2*n_embd_q, blck_size_perf)};
                 }
                 return {granularity_q};
@@ -1015,6 +1095,35 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     ggml_backend_meta_split_state split_state;
     memset(&split_state, 0, sizeof(split_state));
     split_state.axis = tc.axis;
+
+    // Shard the gather table by WHOLE HEADS - one segment per head, each owned
+    // outright by one device - rather than letting the generic path slice every head
+    // across every device. That keeps the routing static: which device serves a
+    // lookup is fixed by the head index, a property of the graph and not of the
+    // token. Head groups are contiguous and unrotated so each device's slice is ONE
+    // contiguous global row range, which is what lets the masked gather test a single
+    // bound. A token still needs every head, so each device gathers the heads it owns,
+    // zeros the rows it does not, and one allreduce sums the partials into the vector.
+    if (llama_ple_shard_enabled() && tensor_name == "per_layer_token_embd.weight" &&
+            tc.axis == GGML_BACKEND_SPLIT_AXIS_1) {
+        const size_t n_head_ple = hparams.ple_n_heads;
+        GGML_ASSERT(n_head_ple > 0 && n_head_ple <= 16);
+        GGML_ASSERT(n_lanes <= n_head_ple &&
+                "the PLE gather table needs at least one hash head per device");
+        int64_t assigned = 0;
+        size_t  j_last   = lane_base;
+        for (size_t s = 0; s < n_head_ple; s++) {
+            const size_t j = lane_base + s*n_lanes/n_head_ple;
+            split_state.ne[s*ud->n_devices + j] = (int64_t) hparams.ple_head_vocab_sizes[s];
+            split_state.nr[s] = 1;
+            assigned += (int64_t) hparams.ple_head_vocab_sizes[s];
+            j_last = j;
+        }
+        // the table is padded past the last head, that tail goes to its owner
+        split_state.ne[(n_head_ple - 1)*ud->n_devices + j_last] += tensor->ne[1] - assigned;
+        split_state.n_segments = n_head_ple;
+        return split_state;
+    }
     if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
         const int64_t blck_size = ggml_blck_size(tc.tensor_axis_0->type);
         const float * tensor_split = ud->model->tensor_split();
@@ -1187,6 +1296,7 @@ const char * llm_type_name(llm_type type) {
         case LLM_TYPE_35B_A3B:       return "35B.A3B";
         case LLM_TYPE_48B_A3B:       return "48B.A3B";
         case LLM_TYPE_80B_A3B:       return "80B.A3B";
+        case LLM_TYPE_A3B:           return "A3B";
         case LLM_TYPE_100B_A6B:      return "100B.A6B";
         case LLM_TYPE_102B_A12B:     return "102B.A12B";
         case LLM_TYPE_106B_A12B:     return "106B.A12B";
@@ -1399,6 +1509,11 @@ struct llama_model::impl {
 
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
+
+    // buffers over a file mapping for TENSOR_READ_LAZY tensors. Held separately from
+    // ctxs_bufs: they are not allocations, so they must not appear in the memory
+    // breakdown, and ctxs_bufs carries a one-buffer-per-context invariant.
+    std::vector<ggml_backend_buffer_ptr> lazy_bufs;
 
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
@@ -1948,12 +2063,55 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const size_t n_max_backend_buffer = ml.ctx_map.size() * ml.files.size();
     pimpl->ctxs_bufs.reserve(n_max_backend_buffer);
 
+    // Bind lazily-read tensors straight to the file mapping. Must happen before the
+    // allocator below, which only sizes tensors whose data is still null - that is
+    // what keeps the gather table out of the allocation and off the host RSS.
+    for (auto & [buft_lazy, ctx_lazy] : ml.ctx_map) {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx_lazy.get()); t != nullptr;
+                t = ggml_get_next_tensor(ctx_lazy.get(), t)) {
+            void * addr = ml.lazy_tensor_addr(ggml_get_name(t));
+            if (addr == nullptr) {
+                continue;
+            }
+            ggml_backend_buffer_t lbuf = ggml_backend_cpu_buffer_from_ptr(addr, ggml_nbytes(t));
+            if (lbuf == nullptr) {
+                continue;
+            }
+            ggml_backend_buffer_set_usage(lbuf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            t->buffer = lbuf;
+            t->data   = addr;
+            pimpl->lazy_bufs.emplace_back(lbuf);
+            LLAMA_LOG_INFO("%s: tensor %s bound to its file mapping, rows read on demand\n",
+                    __func__, ggml_get_name(t));
+        }
+    }
+
     for (auto & [buft, ctx_ptr] : ml.ctx_map) {
         ggml_context * ctx = ctx_ptr.get();
 
         // skip contexts without tensors
         if (ggml_get_first_tensor(ctx) == nullptr) {
             continue;
+        }
+
+        // A context whose tensors are all bound to a file mapping has nothing left to
+        // allocate, and the allocator reports that with a null buffer - which the code
+        // below would otherwise treat as an allocation failure. The lazily read gather
+        // table is alone in its CPU context, so it hits this every time.
+        {
+            bool needs_alloc = false;
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                if (t->data == nullptr && t->view_src == nullptr) {
+                    needs_alloc = true;
+                    break;
+                }
+            }
+            if (!needs_alloc) {
+                // the context still owns the tensor structs, so the model has to keep it
+                // alive even though there is nothing to allocate for it
+                pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::vector<ggml_backend_buffer_ptr>{});
+                continue;
+            }
         }
 
         llama_buf_map buf_map;
@@ -2090,8 +2248,31 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
     if (narrow_shexp) {
         buft_list_layer = &pimpl->gpu_buft_list_plain.at(layer_dev->dev);
     }
+    // The gather table is an input-class tensor, so it normally lands on the CPU and
+    // is read lazily. Sharding it means putting it back in VRAM across the TP group,
+    // which also means dropping the lazy flag - there is no file mapping to page from
+    // once it lives on the devices.
+    const buft_list_t * buft_list_input = pimpl->dev_input.buft_list;
+    if (tn.tensor == LLM_TENSOR_PER_LAYER_TOKEN_EMBD) {
+        if (llama_ple_shard_enabled() && params.split_mode == LLAMA_SPLIT_MODE_TENSOR &&
+                !pimpl->dev_layer.empty()) {
+            buft_list_input = pimpl->dev_layer[0].buft_list;
+            flags &= ~llama_model_loader::TENSOR_READ_LAZY;
+        } else {
+            // Pin it to plain CPU. The host placement must not depend on the CUDA
+            // GET_ROWS support check refusing a 160 wide IQ4_NL row: the shard's
+            // kernel fix relaxes exactly that check, and the table would then be
+            // accepted into VRAM and mirrored at 27 GB per device.
+            static const buft_list_t cpu_only = {
+                { ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU),
+                  ggml_backend_cpu_buffer_type() }
+            };
+            buft_list_input = &cpu_only;
+        }
+    }
+
     return ml.create_tensor(
-        hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
+        hparams, &pimpl->cpu_buft_list, buft_list_input, pimpl->dev_output.buft_list, buft_list_layer,
         tn, ne, flags);
 }
 
@@ -2143,6 +2324,10 @@ llama_split_mode llama_model::split_mode() const {
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+        if (bufs.empty()) {
+            // context kept alive only to own tensors that live in a file mapping
+            continue;
+        }
         if (hparams.no_alloc) {
             GGML_ASSERT(bufs.size() == 1);
             ggml_backend_buffer_t buf = bufs[0].get();
@@ -2725,6 +2910,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     // layer filters, so pick the right one here
                     llama_memory_hybrid::layer_filter_cb filter_attn = nullptr;
                     llama_memory_hybrid::layer_filter_cb filter_recr = nullptr;
+                    // only the sparse-attention architectures use llama_memory_hybrid_idx
+                    // a null filter_idx means the GGUF has no indexer tensors
+                    llama_memory_hybrid::layer_filter_cb filter_idx  = nullptr;
+                    const bool needs_mem_idx = (arch == LLM_ARCH_QWEN4EXP);
                     if (arch == LLM_ARCH_FALCON_H1) {
                         filter_attn = [&](uint32_t) { return true; };
                         filter_recr = [&](uint32_t) { return true; };
@@ -2735,13 +2924,43 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         filter_recr = [&](uint32_t il) {
                             return hparams.is_recr(il) && hparams.n_ff(il) == 0;
                         };
-                    } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_MINIMAX_01) {
-                        filter_attn = [&](uint32_t il) {
-                            return il < hparams.n_layer() && !hparams.is_recr(il);
+                    } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_MINIMAX_01) {
+                        // Key the filters on which tensors the FILE actually has, not on
+                        // layer arithmetic alone. A head-only export carries just the MTP
+                        // block, so a purely arithmetic filter admits trunk layers that were
+                        // never loaded and the split-state resolver then aborts looking for
+                        // their siblings (cache_k_l3 wanting blk.3.attn_output.weight).
+                        // An MTP context additionally wants ONLY the blocks past the trunk,
+                        // which is what separates it from a normal context over the same file.
+                        const bool mtp_ctx = params.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
+                        filter_attn = [&, mtp_ctx](uint32_t il) {
+                            if (il >= layers.size() || layers[il].wo == nullptr) {
+                                return false;
+                            }
+                            return mtp_ctx ? il >= hparams.n_layer()
+                                           : il <  hparams.n_layer() && !hparams.is_recr(il);
                         };
-                        filter_recr = [&](uint32_t il) {
-                            return il < hparams.n_layer() && hparams.is_recr(il);
+                        filter_recr = [&, mtp_ctx](uint32_t il) {
+                            if (il >= layers.size() || layers[il].ssm_out == nullptr) {
+                                return false;
+                            }
+                            return mtp_ctx ? il >= hparams.n_layer()
+                                           : il <  hparams.n_layer() && hparams.is_recr(il);
                         };
+
+                        if (arch == LLM_ARCH_QWEN4EXP && hparams.indexer_head_size > 0) {
+                            // QSA runs on the dense-attention layers only
+                            // same rule as filter_attn: the QSA indexer cache must cover
+                            // exactly the blocks that run, or the graph asks the cache for
+                            // a layer it never registered (map_layer_ids::at throws)
+                            filter_idx = [&, mtp_ctx](uint32_t il) {
+                                if (il >= layers.size() || layers[il].index_q_proj == nullptr) {
+                                    return false;
+                                }
+                                return mtp_ctx ? il >= hparams.n_layer()
+                                               : il <  hparams.n_layer() && !hparams.is_recr(il);
+                            };
+                        }
                     }
 
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
@@ -2764,6 +2983,27 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr));
+                    } else if (needs_mem_idx) {
+                        // sparse attention over a per-token indexer cache, in its own memory type
+                        res = new llama_memory_hybrid_idx(
+                            /* model             */ *this,
+                            /* attn_type_k       */ params.type_k,
+                            /* attn_type_v       */ params.type_v,
+                            /* attn_v_trans      */ !cparams.flash_attn,
+                            /* attn_kv_size      */ cparams.n_ctx_seq,
+                            /* attn_n_pad        */ 1,
+                            /* attn_n_swa        */ hparams.n_swa,
+                            /* attn_swa_type     */ hparams.swa_type,
+                            /* recurrent_type_k  */ GGML_TYPE_F32,
+                            /* recurrent_type_v  */ GGML_TYPE_F32,
+                            /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                            /* n_seq_max         */ cparams.n_seq_max,
+                            /* n_rs_seq          */ cparams.n_rs_seq,
+                            /* offload           */ cparams.offload_kqv,
+                            /* unified           */ cparams.kv_unified,
+                            /* filter_attn       */ std::move(filter_attn),
+                            /* filter_recr       */ std::move(filter_recr),
+                            /* filter_idx        */ std::move(filter_idx));
                     } else {
                         res = new llama_memory_hybrid(
                             /* model             */ *this,
@@ -2925,6 +3165,7 @@ llama_model_params llama_model_default_params() {
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
         /*.tensor_parallel_size        =*/ 0,
+        /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
@@ -2975,6 +3216,10 @@ int32_t llama_model_n_layer(const llama_model * model) {
 
 int32_t llama_model_n_layer_nextn(const llama_model * model) {
     return model->hparams.n_layer_nextn;
+}
+
+int32_t llama_model_dflash_selector_top_k(const llama_model * model) {
+    return model->hparams.dflash_selector_top_k;
 }
 
 int32_t llama_model_n_head(const llama_model * model) {
@@ -3174,6 +3419,10 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
             return LLAMA_ROPE_TYPE_NEOX;
 
         case LLM_ARCH_DFLASH:
+            // drafts for M-RoPE targets carry rope sections and follow the target's temporal dim
+            if (const auto & s = model->hparams.rope_sections; s[0] || s[1] || s[2] || s[3]) {
+                return LLAMA_ROPE_TYPE_MROPE;
+            }
             // DSV4 DSpark drafters use DeepSeek-V4's normal RoPE; legacy DFlash backbones are NeoX
             return model->hparams.dsv4_hc_mult > 0 ? LLAMA_ROPE_TYPE_NORM : LLAMA_ROPE_TYPE_NEOX;
 
@@ -3184,6 +3433,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_QWEN3VLMOE:
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN35MOE:
+        case LLM_ARCH_QWEN4EXP:
         case LLM_ARCH_QWEN3TTS:
             return LLAMA_ROPE_TYPE_IMROPE;
 
@@ -3360,7 +3610,8 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
     TENSOR_NOT_REQUIRED   (llama_model_loader::TENSOR_NOT_REQUIRED),
     TENSOR_SKIP           (llama_model_loader::TENSOR_SKIP),
     TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL),
-    TENSOR_ALLOW_RESHAPE  (llama_model_loader::TENSOR_ALLOW_RESHAPE) {}
+    TENSOR_ALLOW_RESHAPE  (llama_model_loader::TENSOR_ALLOW_RESHAPE),
+    TENSOR_READ_LAZY      (llama_model_loader::TENSOR_READ_LAZY) {}
 
 ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     GGML_ASSERT(ml != nullptr);
