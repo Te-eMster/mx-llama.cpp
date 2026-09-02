@@ -1513,7 +1513,6 @@ struct llama_model::impl {
     // buffers over a file mapping for TENSOR_READ_LAZY tensors. Held separately from
     // ctxs_bufs: they are not allocations, so they must not appear in the memory
     // breakdown, and ctxs_bufs carries a one-buffer-per-context invariant.
-    std::vector<ggml_backend_buffer_ptr> lazy_bufs;
 
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
@@ -1587,6 +1586,8 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_POOLING_TYPE,            hparams.pooling_type,    false);
     ml.get_key(LLM_KV_BLOCK_COUNT,             hparams.n_layer_all);
     GGML_ASSERT(hparams.n_layer_all > 0 && hparams.n_layer_all <= LLAMA_MAX_LAYERS);
+    ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS,    hparams.n_layer_nextn,   false);
+    GGML_ASSERT(hparams.n_layer_nextn <= hparams.n_layer_all);
     ml.get_key(LLM_KV_EXPERT_COUNT,            hparams.n_expert,        false);
     ml.get_key(LLM_KV_EXPERT_USED_COUNT,       hparams.n_expert_used,   false);
     ml.get_key(LLM_KV_EXPERT_GROUP_COUNT,      hparams.n_expert_groups, false);
@@ -1646,8 +1647,8 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     std::fill(hparams.swiglu_clamp_exp.begin(),   hparams.swiglu_clamp_exp.end(),   0.0f);
     std::fill(hparams.swiglu_clamp_shexp.begin(), hparams.swiglu_clamp_shexp.end(), 0.0f);
 
-    ml.get_key_or_arr(LLM_KV_FEED_FORWARD_LENGTH,  hparams.n_ff_arr,   hparams.n_layer(), false);
-    ml.get_key_or_arr(LLM_KV_ATTENTION_HEAD_COUNT, hparams.n_head_arr, hparams.n_layer(), false);
+    ml.get_key_or_arr(LLM_KV_FEED_FORWARD_LENGTH,  hparams.n_ff_arr,   hparams.n_layer_all, false);
+    ml.get_key_or_arr(LLM_KV_ATTENTION_HEAD_COUNT, hparams.n_head_arr, hparams.n_layer_all, false);
 
     // Populate deepstack_mapping_arr - initialized to -1 (no deepstack)
     std::fill(hparams.deepstack_mapping_arr.begin(), hparams.deepstack_mapping_arr.end(), -1);
@@ -1655,7 +1656,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     // n_head_kv is optional, default to n_head
     hparams.n_head_kv_arr = hparams.n_head_arr;
 
-    ml.get_key_or_arr(LLM_KV_ATTENTION_HEAD_COUNT_KV, hparams.n_head_kv_arr, hparams.n_layer(), false);
+    ml.get_key_or_arr(LLM_KV_ATTENTION_HEAD_COUNT_KV, hparams.n_head_kv_arr, hparams.n_layer_all, false);
 
     bool rope_finetuned = false;
     ml.get_key(LLM_KV_ROPE_SCALING_FINETUNED, rope_finetuned, false);
@@ -2063,30 +2064,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const size_t n_max_backend_buffer = ml.ctx_map.size() * ml.files.size();
     pimpl->ctxs_bufs.reserve(n_max_backend_buffer);
 
-    // Bind lazily-read tensors straight to the file mapping. Must happen before the
-    // allocator below, which only sizes tensors whose data is still null - that is
-    // what keeps the gather table out of the allocation and off the host RSS.
-    for (auto & [buft_lazy, ctx_lazy] : ml.ctx_map) {
-        for (ggml_tensor * t = ggml_get_first_tensor(ctx_lazy.get()); t != nullptr;
-                t = ggml_get_next_tensor(ctx_lazy.get(), t)) {
-            void * addr = ml.lazy_tensor_addr(ggml_get_name(t));
-            if (addr == nullptr) {
-                continue;
-            }
-            ggml_backend_buffer_t lbuf = ggml_backend_cpu_buffer_from_ptr(addr, ggml_nbytes(t));
-            if (lbuf == nullptr) {
-                continue;
-            }
-            ggml_backend_buffer_set_usage(lbuf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-            t->buffer = lbuf;
-            t->data   = addr;
-            pimpl->lazy_bufs.emplace_back(lbuf);
-            LLAMA_LOG_INFO("%s: tensor %s bound to its file mapping, rows read on demand\n",
-                    __func__, ggml_get_name(t));
-        }
-    }
-
-    for (auto & [buft, ctx_ptr] : ml.ctx_map) {
+    for (auto & [ctx_key, ctx_ptr] : ml.ctx_map) {
+        ggml_backend_buffer_type_t buft = ctx_key.buft;
         ggml_context * ctx = ctx_ptr.get();
 
         // skip contexts without tensors
@@ -2132,7 +2111,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
 
         std::vector<ggml_backend_buffer_ptr> bufs;
-        if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+
+        // a lazy context is mapped whatever the load mode, but the memory-fit pass maps nothing
+        const bool is_lazy_mapped = ctx_key.lazy && !ml.no_alloc;
+
+        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
             GGML_ASSERT(!ml.no_alloc);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer

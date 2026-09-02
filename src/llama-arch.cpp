@@ -1110,6 +1110,11 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
     switch (arch) {
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN35MOE:
+        // QWEN4EXP is deliberately absent. Upstream 0eadefebd3 enabled recurrent
+        // state rollback for it, but that path fails the first dirty-context
+        // checkpoint replay on the full model, so the honest behaviour is the
+        // clamp we had before it existed. Do not re-add without a passing
+        // dirty-restore gate.
         case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_NEMOTRON_H:
         case LLM_ARCH_NEMOTRON_H_MOE:
@@ -1155,6 +1160,7 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_BAILINGMOE3:
         case LLM_ARCH_KIMI_K3:
         case LLM_ARCH_QWEN3TTS:
+        case LLM_ARCH_QWEN4EXP:   // TODO: fix test-llama-archs
             return false;
         default:
             return true;
