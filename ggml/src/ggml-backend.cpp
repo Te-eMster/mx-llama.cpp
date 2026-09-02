@@ -868,6 +868,7 @@ struct ggml_backend_sched {
     int cur_copy;
     int next_copy;
     ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
+    bool events_recorded[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
     struct ggml_tensor ** graph_inputs;
     int n_graph_inputs;
     int graph_inputs_capacity;
@@ -1893,6 +1894,68 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 }
 
+static bool ggml_sched_rebind_event_trace_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char * e = getenv("GGML_SCHED_REBIND_EVENT_TRACE");
+        v = (e != NULL && atoi(e) != 0) ? 1 : 0;
+    }
+    return v == 1;
+}
+
+// A cached layout changes allocator-wide tensor addresses.  It is safe to
+// apply only after work from every copy slot has retired, not merely the slot
+// selected for the next graph.  Querying is non-blocking: a live event rejects
+// the fast rebind and lets the existing tier-3 drain/reserve path do the wait.
+static bool ggml_backend_sched_rebind_events_complete(ggml_backend_sched_t sched) {
+    const bool trace = ggml_sched_rebind_event_trace_on();
+    int main_recorded = 0;
+    int main_pending = 0;
+    int main_unqueryable = 0;
+    int staging_recorded = 0;
+    int staging_pending = 0;
+    int staging_unqueryable = 0;
+
+    for (int b = 0; b < sched->n_backends; ++b) {
+        const bool query_supported = sched->backends[b]->device != nullptr &&
+                sched->backends[b]->device->iface.event_query != nullptr;
+        for (int c = 0; c < sched->n_copies; ++c) {
+            if (sched->events_recorded[b][c]) {
+                ++main_recorded;
+                if (!query_supported || !ggml_backend_event_query(sched->events[b][c])) {
+                    ++main_pending;
+                    main_unqueryable += query_supported ? 0 : 1;
+                    if (!trace) {
+                        return false;
+                    }
+                }
+            }
+            if (sched->input_staging_events_recorded[b][c]) {
+                ++staging_recorded;
+                if (!query_supported || !ggml_backend_event_query(sched->input_staging_events[b][c])) {
+                    ++staging_pending;
+                    staging_unqueryable += query_supported ? 0 : 1;
+                    if (!trace) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    const bool complete = main_pending == 0 && staging_pending == 0;
+    if (trace) {
+        fprintf(stderr,
+                "REBIND-EVENT-SUMMARY sched=%p main_recorded=%d main_pending=%d main_unqueryable=%d "
+                "staging_recorded=%d staging_pending=%d staging_unqueryable=%d guard=%s\n",
+                (void *) sched, main_recorded, main_pending, main_unqueryable,
+                staging_recorded, staging_pending, staging_unqueryable,
+                complete ? "ALLOW_TIER2" : "FALLBACK_TIER3");
+    }
+
+    return complete;
+}
+
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     bool backend_ids_changed = false;
     for (int i = 0; i < sched->graph.n_nodes; i++) {
@@ -1917,11 +1980,13 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         // The assignment changed or the active layout does not fit. Before
         // paying the reserve (which drains every backend and serializes any
         // cross-chunk pipeline overlap), try the allocation-layout cache with
-        // the current buffer-id assignment - a hit re-binds without a drain
-        // and is valid for any buffer count because only an exactly-matching
-        // assignment is adopted.
-        allocated = ggml_gallocr_alloc_graph_ids(sched->galloc, &sched->graph,
-                sched->node_backend_ids, sched->leaf_backend_ids);
+        // the current buffer-id assignment. A hit re-binds without a drain
+        // only when every copy-slot event has retired; otherwise tier 3 keeps
+        // the existing drain/reserve safety path.
+        if (ggml_backend_sched_rebind_events_complete(sched)) {
+            allocated = ggml_gallocr_alloc_graph_ids(sched->galloc, &sched->graph,
+                    sched->node_backend_ids, sched->leaf_backend_ids);
+        }
     }
     if (!allocated) {
 #ifndef NDEBUG
@@ -2298,6 +2363,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             const int64_t t0 = ggml_backend_sched_timing_now(sched);
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+            sched->events_recorded[split_backend_id][sched->cur_copy] = true;
             sched->timing.us_split_event_record += ggml_backend_sched_timing_dt(sched, t0);
         }
 
