@@ -3222,9 +3222,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 if (node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_ADD_ID) {
                     backend_ctx->graph_has_moe_ops = true;
                 }
-                if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(node->view_src->buffer)) {
-                    // FIXME s_copy_main is on the CPU and its view seems to be incorrectly added to the graph nodes.
-                    // For regular usage this doesn't matter since it's a noop but trying to call ggml_backend_meta_buffer_simple_tensor results in a crash.
+                if (node->buffer == nullptr || !ggml_backend_buffer_is_meta(node->buffer)) {
+                    // A node that is not backed by a meta buffer is a view over a tensor
+                    // computed elsewhere (s_copy_main on the CPU, or the token embedding
+                    // when a device-resident node precedes hc_init and the scheduler
+                    // expands its backend onto the view). ggml_backend_sched hands every
+                    // meta consumer a device copy of the view, so the node itself has no
+                    // per-device tensors and nothing to compute: keep it as-is.
                     bcj.nodes[i] = node;
                     continue;
                 }
@@ -3405,6 +3409,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             // only runs on cgraph shape change so this is microsecond-level on the steady
             // state and not a priority.
             auto node_owning_stage = [&](const ggml_tensor * node) -> int {
+                if (node->buffer == nullptr || !ggml_backend_buffer_is_meta(node->buffer)) {
+                    return -1; // not meta-backed, see the node loop: no split state to query
+                }
                 const ggml_backend_meta_split_state ss = ggml_backend_meta_get_split_state(node, /*assume_sync =*/ true);
                 if (ss.axis < 0 || ss.axis >= GGML_MAX_DIMS) {
                     return -1;
@@ -3604,7 +3611,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             int current_stage = fragment ? backend_ctx->frag_last_stage : 0;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
-                if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(node->view_src->buffer)) {
+                if (node->buffer == nullptr || !ggml_backend_buffer_is_meta(node->buffer)) {
+                    // see the node loop above: no split state to query
                     continue;
                 }
                 const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(node, /*assume_sync =*/ false);
