@@ -62,7 +62,25 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     qwen4exp_require_nonzero(ml, LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head);
     qwen4exp_require_nonzero(ml, LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size);
     qwen4exp_require_nonzero(ml, LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
-    ml.get_key_or_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, hparams.dsv4_compress_ratios, hparams.n_layer_all, false);
+    {
+        // compress_ratios may carry n_layer entries (trunk only, the canonical
+        // converter output) or n_layer_all entries (older combined conversions
+        // whose trailing NextN values are untrustworthy). Accept both lengths,
+        // keep the trunk entries, and force the NextN tail to 0: the MTP head
+        // runs with dense attention.
+        std::vector<uint32_t> cr;
+        if (ml.get_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, cr, false)
+                && cr.size() >= hparams.n_layer() && cr.size() <= hparams.n_layer_all) {
+            for (size_t il = 0; il < cr.size(); ++il) {
+                hparams.dsv4_compress_ratios[il] = cr[il];
+            }
+            for (uint32_t il = hparams.n_layer(); il < hparams.n_layer_all; ++il) {
+                hparams.dsv4_compress_ratios[il] = 0;
+            }
+        } else {
+            ml.get_key_or_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, hparams.dsv4_compress_ratios, hparams.n_layer_all, false);
+        }
+    }
 
     // PLE n-gram hash embeddings; if the key group is absent every field stays zero
     hparams.is_ple_impl.reset();
