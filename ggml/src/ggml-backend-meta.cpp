@@ -3222,9 +3222,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 if (node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_ADD_ID) {
                     backend_ctx->graph_has_moe_ops = true;
                 }
-                if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(node->view_src->buffer)) {
-                    // FIXME s_copy_main is on the CPU and its view seems to be incorrectly added to the graph nodes.
-                    // For regular usage this doesn't matter since it's a noop but trying to call ggml_backend_meta_buffer_simple_tensor results in a crash.
+                if (node->buffer == nullptr || !ggml_backend_buffer_is_meta(node->buffer)) {
+                    // A node that is not backed by a meta buffer is a view over a tensor
+                    // computed elsewhere (s_copy_main on the CPU, or the token embedding
+                    // when a device-resident node precedes hc_init and the scheduler
+                    // expands its backend onto the view). ggml_backend_sched hands every
+                    // meta consumer a device copy of the view, so the node itself has no
+                    // per-device tensors and nothing to compute: keep it as-is.
                     bcj.nodes[i] = node;
                     continue;
                 }
@@ -3405,6 +3409,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             // only runs on cgraph shape change so this is microsecond-level on the steady
             // state and not a priority.
             auto node_owning_stage = [&](const ggml_tensor * node) -> int {
+                if (node->buffer == nullptr || !ggml_backend_buffer_is_meta(node->buffer)) {
+                    return -1; // not meta-backed, see the node loop: no split state to query
+                }
                 const ggml_backend_meta_split_state ss = ggml_backend_meta_get_split_state(node, /*assume_sync =*/ true);
                 if (ss.axis < 0 || ss.axis >= GGML_MAX_DIMS) {
                     return -1;
@@ -3604,7 +3611,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             int current_stage = fragment ? backend_ctx->frag_last_stage : 0;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
-                if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(node->view_src->buffer)) {
+                if (node->buffer == nullptr || !ggml_backend_buffer_is_meta(node->buffer)) {
+                    // see the node loop above: no split state to query
                     continue;
                 }
                 const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(node, /*assume_sync =*/ false);
@@ -3776,9 +3784,24 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 // per-lane bitonic selection already agrees. Only the unfused
                 // path (per-lane mirrored score compute, lane-local reduce
                 // ordering) can disagree on near-ties.
+                // The qwen4exp block indexer top-k is exempt as well. Its score
+                // tensor (indexer_score_tokens) is replicated on every lane, and the
+                // broadcast closure is a host round trip per csa layer that also keeps
+                // whole-token capture from engaging. Measured on Qwen3.8 tps4, 30
+                // chunks: broadcast on PPL 3.2619 and 3.2659 (not reproducible), off
+                // 3.1761 twice to the digit, -sm layer reference 3.1729. The TOP_K node
+                // is unnamed (the model names the cont after it), so the key is its
+                // input. GGML_META_TOPK_BCAST_ALL=1 restores the old rule.
+                static const bool topk_bcast_all = []() {
+                    const char * env = getenv("GGML_META_TOPK_BCAST_ALL");
+                    return env != nullptr && atoi(env) != 0;
+                }();
+                const bool topk_mirrored = node->src[0] != nullptr &&
+                    strncmp(node->src[0]->name, "indexer_score_tokens", 20) == 0;
                 const bool bcast_close = topk_bcast && backend_ctx->tps > 1 &&
                     node->op == GGML_OP_TOP_K &&
-                    !(node->src[0] != nullptr && node->src[0]->op == GGML_OP_LIGHTNING_INDEXER);
+                    !(node->src[0] != nullptr && node->src[0]->op == GGML_OP_LIGHTNING_INDEXER) &&
+                    (topk_bcast_all || !topk_mirrored);
                 const bool end_close = (i + 1 == cgraph->n_nodes);
                 if (!ar_close && !bcast_close && !end_close) {
                     continue;

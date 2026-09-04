@@ -261,6 +261,7 @@ struct server_slot {
     llama_tokens spec_draft;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
+    std::vector<int32_t> spec_i_batch_last; // verify rows of the last sampled draft
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
@@ -3942,6 +3943,8 @@ private:
                     : server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
+                // logits row of each verify position, kept for the token probabilities below
+                slot.spec_i_batch_last = slot.spec_i_batch;
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
@@ -3992,6 +3995,7 @@ private:
             }
 
             const auto ids = std::move(slot.spec_draft);
+            const auto i_batch = std::move(slot.spec_i_batch_last);
 
             size_t n_accepted = ids.size() - 1;
             if (slot.spec_is_replay && n_accepted > 0) {
@@ -4027,9 +4031,17 @@ private:
 
                 result.tok          = ids[i];
                 result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
-                result.prob         = 1.0f; // set later
+                result.prob         = 1.0f;
 
-                // TODO: set result.probs
+                if (slot.task->params.sampling.n_probs > 0 && i < i_batch.size()) {
+                    // Each accepted token was sampled from its own logits row of the
+                    // verify batch, still resident until the next decode. The sampler
+                    // candidates only describe the LAST position, so post-sampling
+                    // probabilities are exact for the final token only and the earlier
+                    // ones fall back to the model distribution at their row.
+                    const bool post = slot.task->params.post_sampling_probs && i + 1 == ids.size();
+                    populate_token_probs(slot, result, post, params_base.special, i_batch[i]);
+                }
 
                 slot.stats.n_gen += 1;
 
