@@ -923,7 +923,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                         // the split on the last dim makes the ratio below indivisible.
                         const int64_t src_last = tensor->src[0]->ne[src_ss[0].axis];
                         const int64_t dst_last = tensor->ne[ggml_n_dims(tensor) - 1];
-                        if (dst_last > 0 && src_last > dst_last && src_last % dst_last == 0) {
+                        // Only the gather output takes this fold. A same-rank regroup such as
+                        // DSV4's [512, 64, 1] -> [4096, 8, 1] head-to-group reshape in a one-token
+                        // decode graph passes the same arithmetic (ggml_n_dims drops the trailing 1)
+                        // and must keep its split on the new axis 1, which the general path below
+                        // computes.
+                        const bool gather_out = tensor->src[0]->op == GGML_OP_GET_ROWS;
+                        if (gather_out && dst_last > 0 && src_last > dst_last && src_last % dst_last == 0) {
                             const int64_t fold = src_last / dst_last;
                             if (tensor->ne[0] == tensor->src[0]->ne[0] * fold) {
                                 return {GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1};
