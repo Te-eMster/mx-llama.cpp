@@ -241,12 +241,15 @@ static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const g
         if (!ok_mm && !ok_mmid) return false;
 
         // Keep in sync with the types ggml_cuda_repack_tensor_supported admits.
-        // The per-type ne0 alignment and the per-lane axis-0 split check follow
-        // from ggml_blck_size below, so per-lane slices that are not
-        // block-aligned correctly stay canonical.
+        // The per-type ne0 alignment (32 for the 32-wide blocks, 256 for the K-quant super-blocks) and the per-lane axis-0 split check follow from ggml_blck_size below, so per-lane slices that are not block-aligned correctly stay canonical.
+        // Lane slices reach the repack buffer as plain contiguous tensors through the accumulating set_tensor path, so every repackable type takes the same road here as Q8_0.
         switch (w->type) {
             case GGML_TYPE_Q8_0:
             case GGML_TYPE_MXFP4:
+            case GGML_TYPE_IQ4_NL:
+            case GGML_TYPE_Q6_K:
+            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q5_K:
                 break;
             default:
                 return false;
@@ -923,7 +926,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                         // the split on the last dim makes the ratio below indivisible.
                         const int64_t src_last = tensor->src[0]->ne[src_ss[0].axis];
                         const int64_t dst_last = tensor->ne[ggml_n_dims(tensor) - 1];
-                        if (dst_last > 0 && src_last > dst_last && src_last % dst_last == 0) {
+                        // Only the gather output takes this fold. A same-rank regroup such as
+                        // DSV4's [512, 64, 1] -> [4096, 8, 1] head-to-group reshape in a one-token
+                        // decode graph passes the same arithmetic (ggml_n_dims drops the trailing 1)
+                        // and must keep its split on the new axis 1, which the general path below
+                        // computes.
+                        const bool gather_out = tensor->src[0]->op == GGML_OP_GET_ROWS;
+                        if (gather_out && dst_last > 0 && src_last > dst_last && src_last % dst_last == 0) {
                             const int64_t fold = src_last / dst_last;
                             if (tensor->ne[0] == tensor->src[0]->ne[0] * fold) {
                                 return {GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1};

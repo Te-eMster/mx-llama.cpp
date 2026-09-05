@@ -44,6 +44,20 @@ static std::mutex   s_upl_mutex;
 
 // Repack one tensor into the GCN layout (per-expert stride repack_gcn_nbytes) and
 // upload it; the source may be the host upload buffer or an accumulated staging copy.
+// Activation witness, once per type and device: the server suppresses INFO, so an A/B log must carry a WARN line naming the repacked type, the card and its first tensor, and under a tensor split every lane that repacks must show up.
+// Called from every repack entry (host upload, buffer set_tensor, backend async set_tensor).
+static void repack_witness(const ggml_tensor * tensor, int device) {
+    static std::mutex s_wit_mutex;
+    static bool s_witnessed[GGML_TYPE_COUNT][GGML_CUDA_MAX_DEVICES] = {};
+    std::lock_guard<std::mutex> lock(s_wit_mutex);
+    const int d = device >= 0 && device < GGML_CUDA_MAX_DEVICES ? device : 0;
+    if (!s_witnessed[tensor->type][d]) {
+        s_witnessed[tensor->type][d] = true;
+        GGML_LOG_WARN("q8_repack: repacking %s tensors on device %d (first: %s, %zu bytes)\n",
+            ggml_type_name(tensor->type), device, tensor->name, ggml_nbytes(tensor));
+    }
+}
+
 static void repack_and_upload(ggml_backend_buffer_t buffer, ggml_tensor * tensor,
         const uint8_t * src) {
     ggml_backend_cuda_repack_buffer_type_context * ctx =
@@ -58,6 +72,7 @@ static void repack_and_upload(ggml_backend_buffer_t buffer, ggml_tensor * tensor
     const size_t dst_stride = repack_gcn_nbytes(tensor->type, ne0, ne1);
     const size_t need       = dst_stride * ne2;
 
+    repack_witness(tensor, ctx->device);
     // Pinned double-buffered upload scratch per device: repack into one slot,
     // launch the H2D asynchronously on a dedicated stream, and only wait when
     // the slot comes around again. Hides the upload behind the next tensor's
@@ -159,6 +174,167 @@ static __global__ void repack_mxfp4_kernel(
     }
 }
 
+// Device-side IQ4_NL repack: canonical block_iq4_nl (18 B: f16 d, 16 nibble bytes) to de-aliased nibble rows + an f16 plane, the MXFP4 kernel with a 2-byte scale.
+static __global__ void repack_iq4nl_kernel(
+        const uint8_t * __restrict__ src, uint8_t * __restrict__ dst,
+        const int64_t ne1, const int64_t n_blocks, const int64_t qs_str,
+        const int64_t qs_len, const int64_t src_stride, const int64_t dst_stride,
+        const int64_t total) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+         i < total; i += (int64_t) gridDim.x * blockDim.x) {
+        const int64_t blk = i % n_blocks;
+        const int64_t row = (i / n_blocks) % ne1;
+        const int64_t e   = i / (n_blocks * ne1);
+
+        uint8_t * d_qs = dst + e * dst_stride + row * qs_str + blk * 16;
+        uint8_t * d_d  = dst + e * dst_stride + qs_len + (row * n_blocks + blk) * 2;
+
+        const uint8_t * sb = src + e * src_stride + (row * n_blocks + blk) * 18;
+#pragma unroll
+        for (int k = 0; k < 16; k++) {
+            d_qs[k] = sb[2 + k];
+        }
+        d_d[0] = sb[0];
+        d_d[1] = sb[1];
+    }
+}
+
+// Device-side Q6_K repack, one thread per 32-value sub-block: the host converter's de-interleave, lows on the de-aliased row stride, highs, scale pair, and the f16 d plane written by the sub-block that owns k == 0 of its super-block.
+static __global__ void repack_q6k_kernel(
+        const uint8_t * __restrict__ src, uint8_t * __restrict__ dst,
+        const int64_t ne1, const int64_t n_sub, const int64_t qs_str,
+        const int64_t hoff, const int64_t soff, const int64_t doff, const int64_t nds,
+        const int64_t src_stride, const int64_t dst_stride, const int64_t total) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+         i < total; i += (int64_t) gridDim.x * blockDim.x) {
+        const int64_t sb  = i % n_sub;
+        const int64_t row = (i / n_sub) % ne1;
+        const int64_t e   = i / (n_sub * ne1);
+        const block_q6_K * b = reinterpret_cast<const block_q6_K *>(src + e * src_stride) + row * (n_sub / 8) + (sb >> 3);
+        const int k = (int)(sb & 7);
+        uint8_t raw[32];
+#pragma unroll
+        for (int j = 0; j < 32; j++) {
+            const int v = k * 32 + j;
+            const int h = v >> 7;
+            const int l = v & 127;
+            const uint8_t * ql = b->ql + 64 * h;
+            const uint8_t * qh = b->qh + 32 * h;
+            uint8_t r6;
+            if      (l <  32) { r6 = (ql[l]      & 0xF) | (((qh[l]      >> 0) & 3) << 4); }
+            else if (l <  64) { r6 = (ql[l]      & 0xF) | (((qh[l - 32] >> 2) & 3) << 4); }
+            else if (l <  96) { r6 = (ql[l - 64] >>  4) | (((qh[l - 64] >> 4) & 3) << 4); }
+            else              { r6 = (ql[l - 64] >>  4) | (((qh[l - 96] >> 6) & 3) << 4); }
+            raw[j] = r6;
+        }
+        uint8_t * base  = dst + e * dst_stride;
+        const int64_t wi = row * n_sub + sb;
+        uint8_t * lows  = base + row * qs_str + sb * 16;
+        uint8_t * highs = base + hoff + wi * 8;
+#pragma unroll
+        for (int j = 0; j < 16; j++) {
+            lows[j] = (uint8_t)((raw[j] & 0xF) | ((raw[j + 16] & 0xF) << 4));
+        }
+#pragma unroll
+        for (int m = 0; m < 8; m++) {
+            const int bs = (m & 3) * 4 + (m >> 2) * 16;
+            highs[m] = (uint8_t)( ((raw[bs + 0] >> 4) << 0) | ((raw[bs + 1] >> 4) << 2)
+                                | ((raw[bs + 2] >> 4) << 4) | ((raw[bs + 3] >> 4) << 6));
+        }
+        base[soff + wi * 2 + 0] = (uint8_t) b->scales[2 * k + 0];
+        base[soff + wi * 2 + 1] = (uint8_t) b->scales[2 * k + 1];
+        if (k == 0) {
+            const uint8_t * dp = reinterpret_cast<const uint8_t *>(&b->d);
+            base[doff + (row * nds + (sb >> 3)) * 2 + 0] = dp[0];
+            base[doff + (row * nds + (sb >> 3)) * 2 + 1] = dp[1];
+        }
+    }
+}
+
+// Device-side Q4_K repack, one thread per 32-value sub-block: the host converter's nibble pick, packed on the de-aliased row stride, the scale record and the half2 {d, dmin} written by the sub-block that owns k == 0 of its super-block.
+static __global__ void repack_q4k_kernel(
+        const uint8_t * __restrict__ src, uint8_t * __restrict__ dst,
+        const int64_t ne1, const int64_t n_sub, const int64_t qs_str,
+        const int64_t soff, const int64_t doff, const int64_t nsb,
+        const int64_t src_stride, const int64_t dst_stride, const int64_t total) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+         i < total; i += (int64_t) gridDim.x * blockDim.x) {
+        const int64_t sb  = i % n_sub;
+        const int64_t row = (i / n_sub) % ne1;
+        const int64_t e   = i / (n_sub * ne1);
+        const block_q4_K * b = reinterpret_cast<const block_q4_K *>(src + e * src_stride) + row * (n_sub / 8) + (sb >> 3);
+        const int k = (int)(sb & 7);
+        const uint8_t * q = b->qs + 32 * (k >> 1);
+        const int shift = (k & 1) * 4;
+        uint8_t * base = dst + e * dst_stride;
+        uint8_t * lows = base + row * qs_str + sb * 16;
+#pragma unroll
+        for (int j = 0; j < 16; j++) {
+            const uint8_t v0 = (q[j]      >> shift) & 0xF;
+            const uint8_t v1 = (q[j + 16] >> shift) & 0xF;
+            lows[j] = (uint8_t)(v0 | (v1 << 4));
+        }
+        if (k == 0) {
+            const int64_t sbk = row * nsb + (sb >> 3);
+            const uint8_t * bp = reinterpret_cast<const uint8_t *>(b);
+#pragma unroll
+            for (int j = 0; j < 12; j++) {
+                base[soff + sbk * 12 + j] = b->scales[j];
+            }
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                base[doff + sbk * 4 + j] = bp[j];
+            }
+        }
+    }
+}
+
+// Device-side Q5_K repack, one thread per 32-value sub-block: Q4_K's nibble pick plus the fifth-bit word gathered from qh, the scale record and {d, dmin} by k == 0.
+static __global__ void repack_q5k_kernel(
+        const uint8_t * __restrict__ src, uint8_t * __restrict__ dst,
+        const int64_t ne1, const int64_t n_sub, const int64_t qs_str,
+        const int64_t hoff, const int64_t soff, const int64_t doff, const int64_t nsb,
+        const int64_t src_stride, const int64_t dst_stride, const int64_t total) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+         i < total; i += (int64_t) gridDim.x * blockDim.x) {
+        const int64_t sb  = i % n_sub;
+        const int64_t row = (i / n_sub) % ne1;
+        const int64_t e   = i / (n_sub * ne1);
+        const block_q5_K * b = reinterpret_cast<const block_q5_K *>(src + e * src_stride) + row * (n_sub / 8) + (sb >> 3);
+        const int k = (int)(sb & 7);
+        const uint8_t * q = b->qs + 32 * (k >> 1);
+        const int shift = (k & 1) * 4;
+        const int hbit  = 2 * (k >> 1) + (k & 1);
+        uint8_t * base = dst + e * dst_stride;
+        const int64_t wi = row * n_sub + sb;
+        uint8_t * lows = base + row * qs_str + sb * 16;
+        uint32_t h = 0;
+#pragma unroll
+        for (int j = 0; j < 16; j++) {
+            const uint8_t v0 = (q[j]      >> shift) & 0xF;
+            const uint8_t v1 = (q[j + 16] >> shift) & 0xF;
+            lows[j] = (uint8_t)(v0 | (v1 << 4));
+        }
+#pragma unroll
+        for (int j = 0; j < 32; j++) {
+            h |= (uint32_t)((b->qh[j] >> hbit) & 1) << j;
+        }
+        *reinterpret_cast<uint32_t *>(base + hoff + wi * 4) = h;
+        if (k == 0) {
+            const int64_t sbk = row * nsb + (sb >> 3);
+            const uint8_t * bp = reinterpret_cast<const uint8_t *>(b);
+#pragma unroll
+            for (int j = 0; j < 12; j++) {
+                base[soff + sbk * 12 + j] = b->scales[j];
+            }
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                base[doff + sbk * 4 + j] = bp[j];
+            }
+        }
+    }
+}
+
 struct repack_async_state {
     uint8_t *           scratch  = nullptr;
     size_t              cap      = 0;
@@ -189,6 +365,7 @@ void ggml_cuda_repack_set_tensor_async(int device, cudaStream_t stream,
         GGML_ASSERT(st.cur == nullptr && "repack async upload: previous tensor incomplete");
         st.cur      = tensor;
         st.received = 0;
+        repack_witness(tensor, device);
     }
     GGML_ASSERT(offset + size <= total);
     CUDA_CHECK(cudaMemcpyAsync(st.scratch + offset, data, size, cudaMemcpyHostToDevice, stream));
@@ -216,6 +393,37 @@ void ggml_cuda_repack_set_tensor_async(int device, cudaStream_t stream,
                     st.scratch, (uint8_t *) tensor->data, ne1, n_blocks, qs_str,
                     ne1 * qs_str, (int64_t) src_str, (int64_t) dst_str, n_out);
                 break;
+            case GGML_TYPE_IQ4_NL:
+                repack_iq4nl_kernel<<<grid, block, 0, stream>>>(
+                    st.scratch, (uint8_t *) tensor->data, ne1, n_blocks, qs_str,
+                    ne1 * qs_str, (int64_t) src_str, (int64_t) dst_str, n_out);
+                break;
+            case GGML_TYPE_Q6_K: {
+                const int64_t nds  = (n_blocks + 7) / 8;
+                const int64_t hoff = ne1 * qs_str;
+                const int64_t soff = hoff + ne1 * n_blocks * 8;
+                const int64_t doff = soff + ne1 * n_blocks * 2;
+                repack_q6k_kernel<<<grid, block, 0, stream>>>(
+                    st.scratch, (uint8_t *) tensor->data, ne1, n_blocks, qs_str,
+                    hoff, soff, doff, nds, (int64_t) src_str, (int64_t) dst_str, n_out);
+            } break;
+            case GGML_TYPE_Q4_K: {
+                const int64_t nsb  = (n_blocks + 7) / 8;
+                const int64_t soff = ne1 * qs_str;
+                const int64_t doff = soff + ne1 * nsb * 12;
+                repack_q4k_kernel<<<grid, block, 0, stream>>>(
+                    st.scratch, (uint8_t *) tensor->data, ne1, n_blocks, qs_str,
+                    soff, doff, nsb, (int64_t) src_str, (int64_t) dst_str, n_out);
+            } break;
+            case GGML_TYPE_Q5_K: {
+                const int64_t nsb  = (n_blocks + 7) / 8;
+                const int64_t hoff = ne1 * qs_str;
+                const int64_t soff = hoff + ne1 * n_blocks * 4;
+                const int64_t doff = soff + ne1 * nsb * 12;
+                repack_q5k_kernel<<<grid, block, 0, stream>>>(
+                    st.scratch, (uint8_t *) tensor->data, ne1, n_blocks, qs_str,
+                    hoff, soff, doff, nsb, (int64_t) src_str, (int64_t) dst_str, n_out);
+            } break;
             default:
                 GGML_ABORT("unsupported repack type for async upload");
         }
@@ -270,6 +478,7 @@ static void ggml_backend_cuda_repack_buffer_set_tensor(
     }
 
     const size_t t_nbytes = ggml_nbytes(tensor);
+    repack_witness(tensor, ctx->device);
 
     if (offset != 0 || size != t_nbytes) {
         // Partial write (the meta splitter under -sm tensor): accumulate into a

@@ -89,6 +89,30 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
                     ids_src1.get(), ids_dst.get(), expert_bounds.get(), (uint32_t) ne02,
                     expert_stride, (uint32_t) x_stride, dst_s1);
                 break;
+            case GGML_TYPE_IQ4_NL:
+                mul_mat_vec_repacked_id1<4, 2, 2, GGML_TYPE_IQ4_NL><<<grid, 128, 0, stream>>>(
+                    w, src1_q8_1_d, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), (uint32_t) ne02,
+                    expert_stride, (uint32_t) x_stride, dst_s1);
+                break;
+            case GGML_TYPE_Q5_K:
+                mul_mat_vec_repacked_id1<4, 2, 2, GGML_TYPE_Q5_K><<<grid, 128, 0, stream>>>(
+                    w, src1_q8_1_d, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), (uint32_t) ne02,
+                    expert_stride, (uint32_t) x_stride, dst_s1);
+                break;
+            case GGML_TYPE_Q4_K:
+                mul_mat_vec_repacked_id1<4, 2, 2, GGML_TYPE_Q4_K><<<grid, 128, 0, stream>>>(
+                    w, src1_q8_1_d, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), (uint32_t) ne02,
+                    expert_stride, (uint32_t) x_stride, dst_s1);
+                break;
+            case GGML_TYPE_Q6_K:
+                mul_mat_vec_repacked_id1<4, 2, 2, GGML_TYPE_Q6_K><<<grid, 128, 0, stream>>>(
+                    w, src1_q8_1_d, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), (uint32_t) ne02,
+                    expert_stride, (uint32_t) x_stride, dst_s1);
+                break;
             default: GGML_ABORT("unsupported repack type");
         }
         return;
@@ -121,6 +145,34 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
             case GGML_TYPE_MXFP4: {
                 const dim3 grid((ne01 + 63) / 64, n_assign, 1);
                 mul_mat_vec_rp<GGML_TYPE_MXFP4, 64, 16, true, 16><<<grid, 1024, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                    (const int32_t *) ids->data, nchannels_y, expert_stride,
+                    xs_id, dst_s1);
+            } break;
+            case GGML_TYPE_IQ4_NL: {
+                const dim3 grid((ne01 + 63) / 64, n_assign, 1);
+                mul_mat_vec_rp<GGML_TYPE_IQ4_NL, 64, 16, true, 16><<<grid, 1024, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                    (const int32_t *) ids->data, nchannels_y, expert_stride,
+                    xs_id, dst_s1);
+            } break;
+            case GGML_TYPE_Q5_K: {
+                const dim3 grid((ne01 + 63) / 64, n_assign, 1);
+                mul_mat_vec_rp<GGML_TYPE_Q5_K, 64, 16, true, 16><<<grid, 1024, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                    (const int32_t *) ids->data, nchannels_y, expert_stride,
+                    xs_id, dst_s1);
+            } break;
+            case GGML_TYPE_Q4_K: {
+                const dim3 grid((ne01 + 63) / 64, n_assign, 1);
+                mul_mat_vec_rp<GGML_TYPE_Q4_K, 64, 16, true, 16><<<grid, 1024, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                    (const int32_t *) ids->data, nchannels_y, expert_stride,
+                    xs_id, dst_s1);
+            } break;
+            case GGML_TYPE_Q6_K: {
+                const dim3 grid((ne01 + 63) / 64, n_assign, 1);
+                mul_mat_vec_rp<GGML_TYPE_Q6_K, 64, 16, true, 16><<<grid, 1024, 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
                     (const int32_t *) ids->data, nchannels_y, expert_stride,
                     xs_id, dst_s1);
@@ -191,6 +243,162 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
                 }
             }
         } break;
+        case GGML_TYPE_IQ4_NL: {
+            const bool is_mx = true;
+            if (use_w32) {
+                const int64_t max_tiles_w32 = n_assign / BN_W32 + ne02;
+                ggml_cuda_pool_alloc<int32_t>          tile_off_w32 (ctx.pool(), ne02 + 1);
+                ggml_cuda_pool_alloc<repack_tile_meta> tile_meta_w32(ctx.pool(), max_tiles_w32);
+                repack_tile_off<BN_W32><<<1, 1, 0, stream>>>(expert_bounds.get(), tile_off_w32.get(), tile_meta_w32.get(), ne02);
+                const dim3 grid((ne01 + MMQ_RP_Q8_BM - 1) / MMQ_RP_Q8_BM, max_tiles_w32, 1);
+                if (is_mx) {
+                mmq_gemm_repacked_w32<true, 1, MMQ_RP_Q8_NROW_LANES * 2, GGML_TYPE_IQ4_NL><<<grid, dim3(32, MMQ_RP_Q8_NROW_LANES * 2), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off_w32.get(), tile_meta_w32.get(),
+                    (uint32_t) ne02, expert_stride, dst_s1);
+                } else {
+                mmq_gemm_repacked_w32<true, 1, MMQ_RP_Q8_NROW_LANES * 2, GGML_TYPE_Q8_0><<<grid, dim3(32, MMQ_RP_Q8_NROW_LANES * 2), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off_w32.get(), tile_meta_w32.get(),
+                    (uint32_t) ne02, expert_stride, dst_s1);
+                }
+            } else {
+                const int64_t max_tiles = n_assign / BN_ID + ne02;
+                ggml_cuda_pool_alloc<int32_t>           tile_off (ctx.pool(), ne02 + 1);
+                ggml_cuda_pool_alloc<repack_tile_meta>  tile_meta(ctx.pool(), max_tiles);
+                repack_tile_off<BN_ID><<<1, 1, 0, stream>>>(expert_bounds.get(), tile_off.get(), tile_meta.get(), ne02);
+                // Loose grid.y bound, the kernel's blockIdx.y >= tile_off[n_expert] guard skips slack.
+                const dim3 grid((ne01 + MMQ_RP_Q8_BM - 1) / MMQ_RP_Q8_BM, max_tiles, 1);
+                if (is_mx) {
+                mmq_gemm_repacked<true, MMQ_RP_Q8_TN, MMQ_RP_Q8_NROW_LANES, GGML_TYPE_IQ4_NL><<<grid, dim3(64, MMQ_RP_Q8_NROW_LANES), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(), tile_meta.get(),
+                    (uint32_t) ne02, expert_stride, dst_s1);
+                } else {
+                mmq_gemm_repacked<true, MMQ_RP_Q8_TN, MMQ_RP_Q8_NROW_LANES, GGML_TYPE_Q8_0><<<grid, dim3(64, MMQ_RP_Q8_NROW_LANES), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(), tile_meta.get(),
+                    (uint32_t) ne02, expert_stride, dst_s1);
+                }
+            }
+        } break;
+        case GGML_TYPE_Q5_K: {
+            const bool is_mx = true;
+            if (use_w32) {
+                const int64_t max_tiles_w32 = n_assign / BN_W32 + ne02;
+                ggml_cuda_pool_alloc<int32_t>          tile_off_w32 (ctx.pool(), ne02 + 1);
+                ggml_cuda_pool_alloc<repack_tile_meta> tile_meta_w32(ctx.pool(), max_tiles_w32);
+                repack_tile_off<BN_W32><<<1, 1, 0, stream>>>(expert_bounds.get(), tile_off_w32.get(), tile_meta_w32.get(), ne02);
+                const dim3 grid((ne01 + MMQ_RP_Q8_BM - 1) / MMQ_RP_Q8_BM, max_tiles_w32, 1);
+                if (is_mx) {
+                mmq_gemm_repacked_w32<true, 1, MMQ_RP_Q8_NROW_LANES * 2, GGML_TYPE_Q5_K><<<grid, dim3(32, MMQ_RP_Q8_NROW_LANES * 2), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off_w32.get(), tile_meta_w32.get(),
+                    (uint32_t) ne02, expert_stride, dst_s1);
+                } else {
+                mmq_gemm_repacked_w32<true, 1, MMQ_RP_Q8_NROW_LANES * 2, GGML_TYPE_Q8_0><<<grid, dim3(32, MMQ_RP_Q8_NROW_LANES * 2), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off_w32.get(), tile_meta_w32.get(),
+                    (uint32_t) ne02, expert_stride, dst_s1);
+                }
+            } else {
+                const int64_t max_tiles = n_assign / BN_ID + ne02;
+                ggml_cuda_pool_alloc<int32_t>           tile_off (ctx.pool(), ne02 + 1);
+                ggml_cuda_pool_alloc<repack_tile_meta>  tile_meta(ctx.pool(), max_tiles);
+                repack_tile_off<BN_ID><<<1, 1, 0, stream>>>(expert_bounds.get(), tile_off.get(), tile_meta.get(), ne02);
+                // Loose grid.y bound, the kernel's blockIdx.y >= tile_off[n_expert] guard skips slack.
+                const dim3 grid((ne01 + MMQ_RP_Q8_BM - 1) / MMQ_RP_Q8_BM, max_tiles, 1);
+                if (is_mx) {
+                mmq_gemm_repacked<true, MMQ_RP_Q8_TN, MMQ_RP_Q8_NROW_LANES, GGML_TYPE_Q5_K><<<grid, dim3(64, MMQ_RP_Q8_NROW_LANES), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(), tile_meta.get(),
+                    (uint32_t) ne02, expert_stride, dst_s1);
+                } else {
+                mmq_gemm_repacked<true, MMQ_RP_Q8_TN, MMQ_RP_Q8_NROW_LANES, GGML_TYPE_Q8_0><<<grid, dim3(64, MMQ_RP_Q8_NROW_LANES), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(), tile_meta.get(),
+                    (uint32_t) ne02, expert_stride, dst_s1);
+                }
+            }
+        } break;
+        case GGML_TYPE_Q4_K: {
+            const bool is_mx = true;
+            if (use_w32) {
+                const int64_t max_tiles_w32 = n_assign / BN_W32 + ne02;
+                ggml_cuda_pool_alloc<int32_t>          tile_off_w32 (ctx.pool(), ne02 + 1);
+                ggml_cuda_pool_alloc<repack_tile_meta> tile_meta_w32(ctx.pool(), max_tiles_w32);
+                repack_tile_off<BN_W32><<<1, 1, 0, stream>>>(expert_bounds.get(), tile_off_w32.get(), tile_meta_w32.get(), ne02);
+                const dim3 grid((ne01 + MMQ_RP_Q8_BM - 1) / MMQ_RP_Q8_BM, max_tiles_w32, 1);
+                if (is_mx) {
+                mmq_gemm_repacked_w32<true, 1, MMQ_RP_Q8_NROW_LANES * 2, GGML_TYPE_Q4_K><<<grid, dim3(32, MMQ_RP_Q8_NROW_LANES * 2), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off_w32.get(), tile_meta_w32.get(),
+                    (uint32_t) ne02, expert_stride, dst_s1);
+                } else {
+                mmq_gemm_repacked_w32<true, 1, MMQ_RP_Q8_NROW_LANES * 2, GGML_TYPE_Q8_0><<<grid, dim3(32, MMQ_RP_Q8_NROW_LANES * 2), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off_w32.get(), tile_meta_w32.get(),
+                    (uint32_t) ne02, expert_stride, dst_s1);
+                }
+            } else {
+                const int64_t max_tiles = n_assign / BN_ID + ne02;
+                ggml_cuda_pool_alloc<int32_t>           tile_off (ctx.pool(), ne02 + 1);
+                ggml_cuda_pool_alloc<repack_tile_meta>  tile_meta(ctx.pool(), max_tiles);
+                repack_tile_off<BN_ID><<<1, 1, 0, stream>>>(expert_bounds.get(), tile_off.get(), tile_meta.get(), ne02);
+                // Loose grid.y bound, the kernel's blockIdx.y >= tile_off[n_expert] guard skips slack.
+                const dim3 grid((ne01 + MMQ_RP_Q8_BM - 1) / MMQ_RP_Q8_BM, max_tiles, 1);
+                if (is_mx) {
+                mmq_gemm_repacked<true, MMQ_RP_Q8_TN, MMQ_RP_Q8_NROW_LANES, GGML_TYPE_Q4_K><<<grid, dim3(64, MMQ_RP_Q8_NROW_LANES), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(), tile_meta.get(),
+                    (uint32_t) ne02, expert_stride, dst_s1);
+                } else {
+                mmq_gemm_repacked<true, MMQ_RP_Q8_TN, MMQ_RP_Q8_NROW_LANES, GGML_TYPE_Q8_0><<<grid, dim3(64, MMQ_RP_Q8_NROW_LANES), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(), tile_meta.get(),
+                    (uint32_t) ne02, expert_stride, dst_s1);
+                }
+            }
+        } break;
+        case GGML_TYPE_Q6_K: {
+            const bool is_mx = true;
+            if (use_w32) {
+                const int64_t max_tiles_w32 = n_assign / BN_W32 + ne02;
+                ggml_cuda_pool_alloc<int32_t>          tile_off_w32 (ctx.pool(), ne02 + 1);
+                ggml_cuda_pool_alloc<repack_tile_meta> tile_meta_w32(ctx.pool(), max_tiles_w32);
+                repack_tile_off<BN_W32><<<1, 1, 0, stream>>>(expert_bounds.get(), tile_off_w32.get(), tile_meta_w32.get(), ne02);
+                const dim3 grid((ne01 + MMQ_RP_Q8_BM - 1) / MMQ_RP_Q8_BM, max_tiles_w32, 1);
+                if (is_mx) {
+                mmq_gemm_repacked_w32<true, 1, MMQ_RP_Q8_NROW_LANES * 2, GGML_TYPE_Q6_K><<<grid, dim3(32, MMQ_RP_Q8_NROW_LANES * 2), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off_w32.get(), tile_meta_w32.get(),
+                    (uint32_t) ne02, expert_stride, dst_s1);
+                } else {
+                mmq_gemm_repacked_w32<true, 1, MMQ_RP_Q8_NROW_LANES * 2, GGML_TYPE_Q8_0><<<grid, dim3(32, MMQ_RP_Q8_NROW_LANES * 2), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off_w32.get(), tile_meta_w32.get(),
+                    (uint32_t) ne02, expert_stride, dst_s1);
+                }
+            } else {
+                const int64_t max_tiles = n_assign / BN_ID + ne02;
+                ggml_cuda_pool_alloc<int32_t>           tile_off (ctx.pool(), ne02 + 1);
+                ggml_cuda_pool_alloc<repack_tile_meta>  tile_meta(ctx.pool(), max_tiles);
+                repack_tile_off<BN_ID><<<1, 1, 0, stream>>>(expert_bounds.get(), tile_off.get(), tile_meta.get(), ne02);
+                // Loose grid.y bound, the kernel's blockIdx.y >= tile_off[n_expert] guard skips slack.
+                const dim3 grid((ne01 + MMQ_RP_Q8_BM - 1) / MMQ_RP_Q8_BM, max_tiles, 1);
+                if (is_mx) {
+                mmq_gemm_repacked<true, MMQ_RP_Q8_TN, MMQ_RP_Q8_NROW_LANES, GGML_TYPE_Q6_K><<<grid, dim3(64, MMQ_RP_Q8_NROW_LANES), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(), tile_meta.get(),
+                    (uint32_t) ne02, expert_stride, dst_s1);
+                } else {
+                mmq_gemm_repacked<true, MMQ_RP_Q8_TN, MMQ_RP_Q8_NROW_LANES, GGML_TYPE_Q8_0><<<grid, dim3(64, MMQ_RP_Q8_NROW_LANES), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(), tile_meta.get(),
+                    (uint32_t) ne02, expert_stride, dst_s1);
+                }
+            }
+        } break;
         default: GGML_ABORT("unsupported repack type");
     }
 }
@@ -213,7 +421,7 @@ void ggml_cuda_mul_mat_id_vec_repacked_fused(ggml_backend_cuda_context & ctx,
     GGML_ASSERT(ggml_cuda_repack_mmv_fusion_width_ok(ids->ne[1], true, src0->type));
     GGML_ASSERT(fusion != nullptr && fusion->gate != nullptr);
     GGML_ASSERT(fusion->gate->type == src0->type &&
-                (src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_MXFP4));
+                (src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_IQ4_NL || src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K));
 
     const int64_t ne00 = src0->ne[0];
     const int64_t ne01 = src0->ne[1];
@@ -295,6 +503,34 @@ void ggml_cuda_mul_mat_id_vec_repacked_fused(ggml_backend_cuda_context & ctx,
                     expert_stride, (uint32_t) x_stride, dst_s1,
                     w_gate, x_bias, gate_bias, fusion->glu_op);
                 break;
+            case GGML_TYPE_IQ4_NL:
+                mul_mat_vec_repacked_id1_fused<4, 4, 1, GGML_TYPE_IQ4_NL><<<grid_nc, 256, 0, stream>>>(
+                    w, src1_q8_1_d, (float *) dst->data, (uint32_t) ne00, (uint32_t) ne01,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), (uint32_t) ne02,
+                    expert_stride, (uint32_t) x_stride, dst_s1,
+                    w_gate, x_bias, gate_bias, fusion->glu_op);
+                break;
+            case GGML_TYPE_Q5_K:
+                mul_mat_vec_repacked_id1_fused<4, 4, 1, GGML_TYPE_Q5_K><<<grid_nc, 256, 0, stream>>>(
+                    w, src1_q8_1_d, (float *) dst->data, (uint32_t) ne00, (uint32_t) ne01,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), (uint32_t) ne02,
+                    expert_stride, (uint32_t) x_stride, dst_s1,
+                    w_gate, x_bias, gate_bias, fusion->glu_op);
+                break;
+            case GGML_TYPE_Q4_K:
+                mul_mat_vec_repacked_id1_fused<4, 4, 1, GGML_TYPE_Q4_K><<<grid_nc, 256, 0, stream>>>(
+                    w, src1_q8_1_d, (float *) dst->data, (uint32_t) ne00, (uint32_t) ne01,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), (uint32_t) ne02,
+                    expert_stride, (uint32_t) x_stride, dst_s1,
+                    w_gate, x_bias, gate_bias, fusion->glu_op);
+                break;
+            case GGML_TYPE_Q6_K:
+                mul_mat_vec_repacked_id1_fused<4, 4, 1, GGML_TYPE_Q6_K><<<grid_nc, 256, 0, stream>>>(
+                    w, src1_q8_1_d, (float *) dst->data, (uint32_t) ne00, (uint32_t) ne01,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), (uint32_t) ne02,
+                    expert_stride, (uint32_t) x_stride, dst_s1,
+                    w_gate, x_bias, gate_bias, fusion->glu_op);
+                break;
             default: GGML_ABORT("unsupported repack type");
         }
         return;
@@ -308,6 +544,34 @@ void ggml_cuda_mul_mat_id_vec_repacked_fused(ggml_backend_cuda_context & ctx,
             (uint32_t) x_stride, dst_s1, w_gate, x_bias, gate_bias, fusion->glu_op);
         return;
     }
+    if (src0->type == GGML_TYPE_IQ4_NL) {
+        mul_mat_vec_rp<GGML_TYPE_IQ4_NL, 8, 4, true, 32, true><<<grid, 256, 0, stream>>>(
+            w, src1_q8_1_d, (float *) dst->data, (uint32_t) ne00, (uint32_t) ne01,
+            (const int32_t *) ids->data, (uint32_t) src1->ne[1], expert_stride,
+            (uint32_t) x_stride, dst_s1, w_gate, x_bias, gate_bias, fusion->glu_op);
+        return;
+    }
+    if (src0->type == GGML_TYPE_Q5_K) {
+        mul_mat_vec_rp<GGML_TYPE_Q5_K, 8, 4, true, 32, true><<<grid, 256, 0, stream>>>(
+            w, src1_q8_1_d, (float *) dst->data, (uint32_t) ne00, (uint32_t) ne01,
+            (const int32_t *) ids->data, (uint32_t) src1->ne[1], expert_stride,
+            (uint32_t) x_stride, dst_s1, w_gate, x_bias, gate_bias, fusion->glu_op);
+        return;
+    }
+    if (src0->type == GGML_TYPE_Q4_K) {
+        mul_mat_vec_rp<GGML_TYPE_Q4_K, 8, 4, true, 32, true><<<grid, 256, 0, stream>>>(
+            w, src1_q8_1_d, (float *) dst->data, (uint32_t) ne00, (uint32_t) ne01,
+            (const int32_t *) ids->data, (uint32_t) src1->ne[1], expert_stride,
+            (uint32_t) x_stride, dst_s1, w_gate, x_bias, gate_bias, fusion->glu_op);
+        return;
+    }
+    if (src0->type == GGML_TYPE_Q6_K) {
+        mul_mat_vec_rp<GGML_TYPE_Q6_K, 8, 4, true, 32, true><<<grid, 256, 0, stream>>>(
+            w, src1_q8_1_d, (float *) dst->data, (uint32_t) ne00, (uint32_t) ne01,
+            (const int32_t *) ids->data, (uint32_t) src1->ne[1], expert_stride,
+            (uint32_t) x_stride, dst_s1, w_gate, x_bias, gate_bias, fusion->glu_op);
+        return;
+    }
     mul_mat_vec_q8_0_repacked<8, 4, true, 32, true><<<grid, 256, 0, stream>>>(
         w, src1_q8_1_d, (float *) dst->data, (uint32_t) ne00, (uint32_t) ne01,
         (const int32_t *) ids->data, nullptr, nullptr,
@@ -315,3 +579,4 @@ void ggml_cuda_mul_mat_id_vec_repacked_fused(ggml_backend_cuda_context & ctx,
         (uint32_t) x_stride, dst_s1,
         w_gate, x_bias, gate_bias, fusion->glu_op);
 }
+

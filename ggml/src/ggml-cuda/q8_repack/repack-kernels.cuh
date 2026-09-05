@@ -448,22 +448,47 @@ static __global__ void __launch_bounds__(NWAVES * 64) mul_mat_vec_rp(
     [[maybe_unused]] float acc_gate = 0.0f;
     for (uint32_t sb = (uint32_t) lane; sb < n_sub; sb += LANES) {
         uint4 lo, hi;
-        uint16_t ds;
+        typename rp_traits<WT>::slot_t ds;
         rp_traits<WT>::load_w(wbase, wg, wrow, sb, lo, hi, ds);
         const block_q8_1 * xb = xq + sb;
         const float dx = __low2float(xb->ds);
         const int * x32 = reinterpret_cast<const int *>(xb->qs);
-        int idot = mmvq_dp4a_u4(lo, x32[0], x32[1], x32[2], x32[3]);
-        idot    += mmvq_dp4a_u4(hi, x32[4], x32[5], x32[6], x32[7]);
-        acc += rp_traits<WT>::scale(ds) * dx * (float) idot;
+        if constexpr (rp_traits<WT>::split_scales) {
+            const int ilo = mmvq_dp4a_u4(lo, x32[0], x32[1], x32[2], x32[3]);
+            const int ihi = mmvq_dp4a_u4(hi, x32[4], x32[5], x32[6], x32[7]);
+            const float2 dd = rp_traits<WT>::scale2(ds);
+            acc += dd.x * dx * (float) ilo + dd.y * dx * (float) ihi;
+        } else if constexpr (rp_traits<WT>::affine) {
+            // Affine (Q4_K): d*sc times the dot, minus dmin*m times the stored activation sum (block_q8_1.ds.y).
+            int idot = mmvq_dp4a_u4(lo, x32[0], x32[1], x32[2], x32[3]);
+            idot    += mmvq_dp4a_u4(hi, x32[4], x32[5], x32[6], x32[7]);
+            const float2 dd = rp_traits<WT>::scale2(ds);
+            acc += dd.x * dx * (float) idot - dd.y * __high2float(xb->ds);
+        } else {
+            int idot = mmvq_dp4a_u4(lo, x32[0], x32[1], x32[2], x32[3]);
+            idot    += mmvq_dp4a_u4(hi, x32[4], x32[5], x32[6], x32[7]);
+            acc += rp_traits<WT>::scale(ds) * dx * (float) idot;
+        }
         if constexpr (HAS_FUSION) {
             if (use_gate) {
                 uint4 glo, ghi;
-                uint16_t gds;
+                typename rp_traits<WT>::slot_t gds;
                 rp_traits<WT>::load_w(wbase_gate, wg, wrow, sb, glo, ghi, gds);
-                int gdot = mmvq_dp4a_u4(glo, x32[0], x32[1], x32[2], x32[3]);
-                gdot    += mmvq_dp4a_u4(ghi, x32[4], x32[5], x32[6], x32[7]);
-                acc_gate += rp_traits<WT>::scale(gds) * dx * (float) gdot;
+                if constexpr (rp_traits<WT>::split_scales) {
+                    const int glo_d = mmvq_dp4a_u4(glo, x32[0], x32[1], x32[2], x32[3]);
+                    const int ghi_d = mmvq_dp4a_u4(ghi, x32[4], x32[5], x32[6], x32[7]);
+                    const float2 gd = rp_traits<WT>::scale2(gds);
+                    acc_gate += gd.x * dx * (float) glo_d + gd.y * dx * (float) ghi_d;
+                } else if constexpr (rp_traits<WT>::affine) {
+                    int gdot = mmvq_dp4a_u4(glo, x32[0], x32[1], x32[2], x32[3]);
+                    gdot    += mmvq_dp4a_u4(ghi, x32[4], x32[5], x32[6], x32[7]);
+                    const float2 gd = rp_traits<WT>::scale2(gds);
+                    acc_gate += gd.x * dx * (float) gdot - gd.y * __high2float(xb->ds);
+                } else {
+                    int gdot = mmvq_dp4a_u4(glo, x32[0], x32[1], x32[2], x32[3]);
+                    gdot    += mmvq_dp4a_u4(ghi, x32[4], x32[5], x32[6], x32[7]);
+                    acc_gate += rp_traits<WT>::scale(gds) * dx * (float) gdot;
+                }
             }
         }
     }
@@ -525,7 +550,7 @@ static __device__ void mmq_gemm_repacked_impl(
     const uint32_t n_sub = ne0 >> 5;
     // All layout knowledge lives in rp_traits<WT>: geometry constants built
     // once, sub-block fetches through load_w. The LDS scale array stays
-    // uint16_t for every type - traits::scale() decodes the raw slot.
+    // the trait's slot_t - traits::scale() decodes the raw slot.
     const typename rp_traits<WT>::geom wg(ne0, ne1);
     const block_q8_1_mmq_h * __restrict__ xmmq = reinterpret_cast<const block_q8_1_mmq_h *>(xq);
 
@@ -539,9 +564,14 @@ static __device__ void mmq_gemm_repacked_impl(
     constexpr bool RAW_REG = rp_traits<WT>::raw_lds;
     __shared__ uint4    sW_lo[MMQ_RP_Q8_BM][MMQ_RP_Q8_BK];
     __shared__ uint4    sW_hi[MMQ_RP_Q8_BM][MMQ_RP_Q8_BK];
-    __shared__ uint16_t sWdh[MMQ_RP_Q8_BK][MMQ_RP_Q8_BM];
+    using slot_t = typename rp_traits<WT>::slot_t;
+    static_assert(16 % sizeof(slot_t) == 0, "slot must divide a uint4 fetch");
+    constexpr int SPW = (int) (16 / sizeof(slot_t));   // slots per uint4 LDS fetch
+    __shared__ slot_t   sWdh[MMQ_RP_Q8_BK][MMQ_RP_Q8_BM];
     __shared__ sXq_row_q8 sXq[BN];
     __shared__ float    sXd[BN][MMQ_RP_Q8_BK + 1];
+    // Activation sums, affine types only (the [1] alternative keeps the LDS footprint of every other type unchanged).
+    __shared__ float    sXs[rp_traits<WT>::affine ? BN : 1][MMQ_RP_Q8_BK + 1];
     __shared__ uint32_t sCol[BN];
 
     constexpr int NROW = MMQ_RP_Q8_BM / NRL;
@@ -557,8 +587,9 @@ static __device__ void mmq_gemm_repacked_impl(
 
     uint4    pw_lo[W_EPT];
     uint4    pw_hi[W_EPT];
-    uint16_t pw_d [W_EPT];
+    slot_t   pw_d [W_EPT];
     rp_x_sub px   [X_EPT];
+    [[maybe_unused]] float px_s[X_EPT];
     if constexpr (HAS_IDS) {
         for (int i = t; i < (int) BN; i += NTHREADS) {
             const uint32_t a = a_base + i;
@@ -605,7 +636,7 @@ static __device__ void mmq_gemm_repacked_impl(
                 // not 0, so uninitialised registers would survive into the sum.
                 pw_lo[i] = make_uint4(0, 0, 0, 0);
                 pw_hi[i] = make_uint4(0, 0, 0, 0);
-                pw_d [i] = 0;
+                pw_d [i] = {};
             }
         }
     };
@@ -630,9 +661,17 @@ static __device__ void mmq_gemm_repacked_impl(
                 xcol = xval ? sCol[lr] : 0;
             }
             if (xval && sb < n_sub) {
-                px[i] = rp_x_sub_from_mmq_group(x_grp, xcol, lk);
+                if constexpr (rp_traits<WT>::affine) {
+                    px[i] = rp_x_sub_from_mmq_group_ds(x_grp, xcol, lk, px_s[i]);
+                } else {
+                    px[i] = rp_x_sub_from_mmq_group(x_grp, xcol, lk);
+                }
             } else {
                 px[i].d = 0.0f;
+                if constexpr (rp_traits<WT>::affine) {
+                    // d == 0 does not kill the affine sum term, zero it too
+                    px_s[i] = 0.0f;
+                }
             }
         }
     };
@@ -672,7 +711,11 @@ static __device__ void mmq_gemm_repacked_impl(
                 xcol = sCol[lr];
             }
 
-            px[i] = rp_x_sub_from_mmq_group(x_grp, xcol, lk);
+            if constexpr (rp_traits<WT>::affine) {
+                px[i] = rp_x_sub_from_mmq_group_ds(x_grp, xcol, lk, px_s[i]);
+            } else {
+                px[i] = rp_x_sub_from_mmq_group(x_grp, xcol, lk);
+            }
         }
     };
 
@@ -689,7 +732,7 @@ static __device__ void mmq_gemm_repacked_impl(
             const int lk = e % MMQ_RP_Q8_BK;
             if constexpr (RAW_REG) {
                 uint4 lo, hi;
-                rp_mxfp4_expand(pw_lo[i], lo, hi);
+                rp_traits<WT>::expand_raw(pw_lo[i], lo, hi);
                 sW_lo[lr][lk] = lo;
                 sW_hi[lr][lk] = hi;
             } else {
@@ -713,12 +756,16 @@ static __device__ void mmq_gemm_repacked_impl(
             sXq[sXr].q[lk][0] = px[i].q0;
             sXq[sXr].q[lk][1] = px[i].q1;
             sXd[sXr][lk]    = px[i].d;
+            if constexpr (rp_traits<WT>::affine) {
+                sXs[sXr][lk] = px_s[i];
+            }
         }
     };
 
     auto compute_stage = [&]() {
         for (int kk = 0; kk < MMQ_RP_Q8_BK; kk++) {
             float dx  [TN_];
+            [[maybe_unused]] float sx[TN_];
             int   xq32[TN_][8];
 #pragma unroll
             for (int n = 0; n < TN_; n++) {
@@ -726,6 +773,9 @@ static __device__ void mmq_gemm_repacked_impl(
                 const uint4 q0 = sXq[xcol].q[kk][0];
                 const uint4 q1 = sXq[xcol].q[kk][1];
                 dx[n] = sXd[xcol][kk];
+                if constexpr (rp_traits<WT>::affine) {
+                    sx[n] = sXs[xcol][kk];
+                }
                 xq32[n][0] = (int) q0.x;
                 xq32[n][1] = (int) q0.y;
                 xq32[n][2] = (int) q0.z;
@@ -741,12 +791,12 @@ static __device__ void mmq_gemm_repacked_impl(
             const uint4 * dp16 = reinterpret_cast<const uint4 *>(&sWdh[kk][row_base]);
 
 #pragma unroll
-            for (int g = 0; g < NROW; g += 8) {
-                const uint4 dh4 = dp16[g / 8];
-                const uint16_t * dh = reinterpret_cast<const uint16_t *>(&dh4);
+            for (int g = 0; g < NROW; g += SPW) {
+                const uint4 dh4 = dp16[g / SPW];
+                const slot_t * dh = reinterpret_cast<const slot_t *>(&dh4);
 
 #pragma unroll
-                for (int rr = 0; rr < 8; rr++) {
+                for (int rr = 0; rr < SPW; rr++) {
                     const int r = g + rr;
 
                     const uint4 wlo_c = wlo, whi_c = whi;
@@ -755,11 +805,18 @@ static __device__ void mmq_gemm_repacked_impl(
                         whi = sW_hi[row_base + r + 1][kk];
                     }
 
-                    const float d = rp_traits<WT>::scale(dh[rr]);
+                    [[maybe_unused]] float d = 0.0f, dlo = 0.0f, dhi = 0.0f;
+                    if constexpr (rp_traits<WT>::split_scales || rp_traits<WT>::affine) {
+                        const float2 dd = rp_traits<WT>::scale2(dh[rr]);
+                        dlo = dd.x;
+                        dhi = dd.y;
+                    } else {
+                        d = rp_traits<WT>::scale(dh[rr]);
+                    }
 
 #pragma unroll
                     for (int n = 0; n < TN_; n++) {
-                        if constexpr (WT == GGML_TYPE_MXFP4) {
+                        if constexpr (WT == GGML_TYPE_MXFP4 || rp_traits<WT>::split_scales) {
                             // Stock MXFP4 uses MMQ_DP4A_TXS_Q8_1, i.e. it applies the
                             // scale per 16-value HALF block, while Q8_0 uses TXS_Q8_0
                             // and scales per 32. Split the accumulator the same way -
@@ -774,7 +831,12 @@ static __device__ void mmq_gemm_repacked_impl(
                             hi = ggml_cuda_dp4a((int) whi_c.y, xq32[n][5], hi);
                             hi = ggml_cuda_dp4a((int) whi_c.z, xq32[n][6], hi);
                             hi = ggml_cuda_dp4a((int) whi_c.w, xq32[n][7], hi);
-                            acc[r][n] += d * dx[n] * (float) lo + d * dx[n] * (float) hi;
+                            if constexpr (rp_traits<WT>::split_scales) {
+                                // Per-16-value scales (Q6_K): each half gets its own.
+                                acc[r][n] += dlo * dx[n] * (float) lo + dhi * dx[n] * (float) hi;
+                            } else {
+                                acc[r][n] += d * dx[n] * (float) lo + d * dx[n] * (float) hi;
+                            }
                         } else {
                         int idot = 0;
                         idot = ggml_cuda_dp4a((int) wlo_c.x, xq32[n][0], idot);
@@ -785,7 +847,12 @@ static __device__ void mmq_gemm_repacked_impl(
                         idot = ggml_cuda_dp4a((int) whi_c.z, xq32[n][6], idot);
                         idot = ggml_cuda_dp4a((int) wlo_c.w, xq32[n][3], idot);
                         idot = ggml_cuda_dp4a((int) whi_c.w, xq32[n][7], idot);
-                        acc[r][n] += d * dx[n] * (float) idot;
+                        if constexpr (rp_traits<WT>::affine) {
+                            // Affine (Q4_K): d*sc times the dot, minus dmin*m times the sum.
+                            acc[r][n] += dlo * dx[n] * (float) idot - dhi * sx[n];
+                        } else {
+                            acc[r][n] += d * dx[n] * (float) idot;
+                        }
                         }
                     }
                 }
@@ -935,7 +1002,7 @@ static __device__ __forceinline__ void mul_mat_vec_repacked_nc_impl(
     // register blocking, and at NCOLS=4 the activations are otherwise 4x the
     // weight bytes per step.
     uint32_t wrows [RPL];
-    uint16_t rmasks[RPL];
+    bool rvalid[RPL];
 #pragma unroll
     for (int r = 0; r < RPL; ++r) {
         const int rr = row + r;
@@ -943,7 +1010,7 @@ static __device__ __forceinline__ void mul_mat_vec_repacked_nc_impl(
         // Masking the raw scale slot zeroes dead-row terms for f16; for e8m0 a
         // zero slot decodes to a tiny nonzero, which is finite and discarded at
         // the guarded write below either way.
-        rmasks[r] = (rr < (int) ne1) ? (uint16_t) 0xffffu : (uint16_t) 0x0000u;
+        rvalid[r] = rr < (int) ne1;
     }
 
     // Fused FFN: the gate matrix is read in the same pass as up, so the
@@ -965,51 +1032,75 @@ static __device__ __forceinline__ void mul_mat_vec_repacked_nc_impl(
         // re-read per row from L1, which is cheaper than the register pressure
         // of holding NCOLS x 8 ints alongside the accumulators.
         uint4 wv0[RPL], wv1[RPL];
-        float dw[RPL];
+        [[maybe_unused]] float  dw [RPL];
+        [[maybe_unused]] float2 dw2[RPL];
 #pragma unroll
         for (int r = 0; r < RPL; ++r) {
-            uint16_t db;
+            typename rp_traits<WT>::slot_t db;
             rp_traits<WT>::load_w(wbase, wg, wrows[r], sb, wv0[r], wv1[r], db);
-            dw[r] = rp_traits<WT>::scale(db & rmasks[r]);
+            if constexpr (rp_traits<WT>::split_scales || rp_traits<WT>::affine) {
+                dw2[r] = rp_traits<WT>::scale2(rp_slot_keep(db, rvalid[r]));
+            } else {
+                dw[r] = rp_traits<WT>::scale(rp_slot_keep(db, rvalid[r]));
+            }
         }
         [[maybe_unused]] uint4 gv0[GR], gv1[GR];
-        [[maybe_unused]] float dg[GR];
+        [[maybe_unused]] float  dg [GR];
+        [[maybe_unused]] float2 dg2[GR];
         if constexpr (HAS_FUSION) {
 #pragma unroll
             for (int r = 0; r < RPL; ++r) {
-                uint16_t gb;
+                typename rp_traits<WT>::slot_t gb;
                 rp_traits<WT>::load_w(wbase_gate, wg, wrows[r], sb, gv0[r], gv1[r], gb);
-                dg[r] = rp_traits<WT>::scale(gb & rmasks[r]);
+                if constexpr (rp_traits<WT>::split_scales || rp_traits<WT>::affine) {
+                    dg2[r] = rp_traits<WT>::scale2(rp_slot_keep(gb, rvalid[r]));
+                } else {
+                    dg[r] = rp_traits<WT>::scale(rp_slot_keep(gb, rvalid[r]));
+                }
             }
         }
 #pragma unroll
         for (int c = 0; c < NCOLS; ++c) {
             const block_q8_1 * xb = xq + (size_t) c * xs + sb;
             const float dx = __low2float(xb->ds);
+            [[maybe_unused]] const float sx = __high2float(xb->ds);
             const int * x = reinterpret_cast<const int *>(xb->qs);
 #pragma unroll
             for (int r = 0; r < RPL; ++r) {
-                int idot = 0;
-                idot = ggml_cuda_dp4a((int) wv0[r].x, x[0], idot);
-                idot = ggml_cuda_dp4a((int) wv0[r].y, x[1], idot);
-                idot = ggml_cuda_dp4a((int) wv0[r].z, x[2], idot);
-                idot = ggml_cuda_dp4a((int) wv0[r].w, x[3], idot);
-                idot = ggml_cuda_dp4a((int) wv1[r].x, x[4], idot);
-                idot = ggml_cuda_dp4a((int) wv1[r].y, x[5], idot);
-                idot = ggml_cuda_dp4a((int) wv1[r].z, x[6], idot);
-                idot = ggml_cuda_dp4a((int) wv1[r].w, x[7], idot);
-                acc[r][c] += dw[r] * dx * (float) idot;
+                int ilo = 0, ihi = 0;
+                ilo = ggml_cuda_dp4a((int) wv0[r].x, x[0], ilo);
+                ilo = ggml_cuda_dp4a((int) wv0[r].y, x[1], ilo);
+                ilo = ggml_cuda_dp4a((int) wv0[r].z, x[2], ilo);
+                ilo = ggml_cuda_dp4a((int) wv0[r].w, x[3], ilo);
+                ihi = ggml_cuda_dp4a((int) wv1[r].x, x[4], ihi);
+                ihi = ggml_cuda_dp4a((int) wv1[r].y, x[5], ihi);
+                ihi = ggml_cuda_dp4a((int) wv1[r].z, x[6], ihi);
+                ihi = ggml_cuda_dp4a((int) wv1[r].w, x[7], ihi);
+                if constexpr (rp_traits<WT>::split_scales) {
+                    acc[r][c] += dw2[r].x * dx * (float) ilo + dw2[r].y * dx * (float) ihi;
+                } else if constexpr (rp_traits<WT>::affine) {
+                    acc[r][c] += dw2[r].x * dx * (float) (ilo + ihi) - dw2[r].y * sx;
+                } else {
+                    // one add of the two halves keeps the Q8_0 result bit-identical
+                    acc[r][c] += dw[r] * dx * (float) (ilo + ihi);
+                }
                 if constexpr (HAS_FUSION) {
-                    int gdot = 0;
-                    gdot = ggml_cuda_dp4a((int) gv0[r].x, x[0], gdot);
-                    gdot = ggml_cuda_dp4a((int) gv0[r].y, x[1], gdot);
-                    gdot = ggml_cuda_dp4a((int) gv0[r].z, x[2], gdot);
-                    gdot = ggml_cuda_dp4a((int) gv0[r].w, x[3], gdot);
-                    gdot = ggml_cuda_dp4a((int) gv1[r].x, x[4], gdot);
-                    gdot = ggml_cuda_dp4a((int) gv1[r].y, x[5], gdot);
-                    gdot = ggml_cuda_dp4a((int) gv1[r].z, x[6], gdot);
-                    gdot = ggml_cuda_dp4a((int) gv1[r].w, x[7], gdot);
-                    accg[r][c] += dg[r] * dx * (float) gdot;
+                    int glo_d = 0, ghi_d = 0;
+                    glo_d = ggml_cuda_dp4a((int) gv0[r].x, x[0], glo_d);
+                    glo_d = ggml_cuda_dp4a((int) gv0[r].y, x[1], glo_d);
+                    glo_d = ggml_cuda_dp4a((int) gv0[r].z, x[2], glo_d);
+                    glo_d = ggml_cuda_dp4a((int) gv0[r].w, x[3], glo_d);
+                    ghi_d = ggml_cuda_dp4a((int) gv1[r].x, x[4], ghi_d);
+                    ghi_d = ggml_cuda_dp4a((int) gv1[r].y, x[5], ghi_d);
+                    ghi_d = ggml_cuda_dp4a((int) gv1[r].z, x[6], ghi_d);
+                    ghi_d = ggml_cuda_dp4a((int) gv1[r].w, x[7], ghi_d);
+                    if constexpr (rp_traits<WT>::split_scales) {
+                        accg[r][c] += dg2[r].x * dx * (float) glo_d + dg2[r].y * dx * (float) ghi_d;
+                    } else if constexpr (rp_traits<WT>::affine) {
+                        accg[r][c] += dg2[r].x * dx * (float) (glo_d + ghi_d) - dg2[r].y * sx;
+                    } else {
+                        accg[r][c] += dg[r] * dx * (float) (glo_d + ghi_d);
+                    }
                 }
             }
         }
