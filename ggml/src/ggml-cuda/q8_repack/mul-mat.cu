@@ -77,6 +77,22 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
                         ggml_cuda_mul_mat_repacked_nc_t<GGML_TYPE_MXFP4>(w, xq, dst_d,
                             ne00, ne01, ne11, (uint32_t) x_stride, dst_s1, stream);
                         break;
+                    case GGML_TYPE_IQ4_NL:
+                        ggml_cuda_mul_mat_repacked_nc_t<GGML_TYPE_IQ4_NL>(w, xq, dst_d,
+                            ne00, ne01, ne11, (uint32_t) x_stride, dst_s1, stream);
+                        break;
+                    case GGML_TYPE_Q5_K:
+                        ggml_cuda_mul_mat_repacked_nc_t<GGML_TYPE_Q5_K>(w, xq, dst_d,
+                            ne00, ne01, ne11, (uint32_t) x_stride, dst_s1, stream);
+                        break;
+                    case GGML_TYPE_Q4_K:
+                        ggml_cuda_mul_mat_repacked_nc_t<GGML_TYPE_Q4_K>(w, xq, dst_d,
+                            ne00, ne01, ne11, (uint32_t) x_stride, dst_s1, stream);
+                        break;
+                    case GGML_TYPE_Q6_K:
+                        ggml_cuda_mul_mat_repacked_nc_t<GGML_TYPE_Q6_K>(w, xq, dst_d,
+                            ne00, ne01, ne11, (uint32_t) x_stride, dst_s1, stream);
+                        break;
                     default: GGML_ABORT("unsupported repack type");
                 }
             }
@@ -284,6 +300,30 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
                     nullptr, 1, 0, 0, 0);
             } break;
+            case GGML_TYPE_IQ4_NL: {
+                const dim3 grid((ne01 + 15) / 16, 1, 1);
+                mul_mat_vec_rp<GGML_TYPE_IQ4_NL, 16, 16, false><<<grid, 1024, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                    nullptr, 0, 0, 0, 1, 0, 0, 0);
+            } break;
+            case GGML_TYPE_Q5_K: {
+                const dim3 grid((ne01 + 15) / 16, 1, 1);
+                mul_mat_vec_rp<GGML_TYPE_Q5_K, 16, 16, false><<<grid, 1024, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                    nullptr, 0, 0, 0, 1, 0, 0, 0);
+            } break;
+            case GGML_TYPE_Q4_K: {
+                const dim3 grid((ne01 + 15) / 16, 1, 1);
+                mul_mat_vec_rp<GGML_TYPE_Q4_K, 16, 16, false><<<grid, 1024, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                    nullptr, 0, 0, 0, 1, 0, 0, 0);
+            } break;
+            case GGML_TYPE_Q6_K: {
+                const dim3 grid((ne01 + 15) / 16, 1, 1);
+                mul_mat_vec_rp<GGML_TYPE_Q6_K, 16, 16, false><<<grid, 1024, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                    nullptr, 0, 0, 0, 1, 0, 0, 0);
+            } break;
             default: GGML_ABORT("unsupported repack type");
         }
         return;
@@ -307,6 +347,26 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
                     nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
                 break;
+            case GGML_TYPE_IQ4_NL:
+                mmq_gemm_repacked<false, MMQ_RP_Q8_TN, nrl, GGML_TYPE_IQ4_NL><<<grid, dim3(64, nrl), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
+                    nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+                break;
+            case GGML_TYPE_Q5_K:
+                mmq_gemm_repacked<false, MMQ_RP_Q8_TN, nrl, GGML_TYPE_Q5_K><<<grid, dim3(64, nrl), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
+                    nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+                break;
+            case GGML_TYPE_Q4_K:
+                mmq_gemm_repacked<false, MMQ_RP_Q8_TN, nrl, GGML_TYPE_Q4_K><<<grid, dim3(64, nrl), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
+                    nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+                break;
+            case GGML_TYPE_Q6_K:
+                mmq_gemm_repacked<false, MMQ_RP_Q8_TN, nrl, GGML_TYPE_Q6_K><<<grid, dim3(64, nrl), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
+                    nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+                break;
             default: GGML_ABORT("unsupported repack type");
         }
     } else {
@@ -321,6 +381,26 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                 break;
             case GGML_TYPE_MXFP4:
                 mmq_gemm_repacked_w32<false, 1, nrl*2, GGML_TYPE_MXFP4><<<grid, dim3(32, nrl*2), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
+                    nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+                break;
+            case GGML_TYPE_IQ4_NL:
+                mmq_gemm_repacked_w32<false, 1, nrl*2, GGML_TYPE_IQ4_NL><<<grid, dim3(32, nrl*2), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
+                    nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+                break;
+            case GGML_TYPE_Q5_K:
+                mmq_gemm_repacked_w32<false, 1, nrl*2, GGML_TYPE_Q5_K><<<grid, dim3(32, nrl*2), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
+                    nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+                break;
+            case GGML_TYPE_Q4_K:
+                mmq_gemm_repacked_w32<false, 1, nrl*2, GGML_TYPE_Q4_K><<<grid, dim3(32, nrl*2), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
+                    nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+                break;
+            case GGML_TYPE_Q6_K:
+                mmq_gemm_repacked_w32<false, 1, nrl*2, GGML_TYPE_Q6_K><<<grid, dim3(32, nrl*2), 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
                     nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
                 break;
@@ -398,6 +478,26 @@ void ggml_cuda_mul_mat_vec_repacked_fused(ggml_backend_cuda_context & ctx,
         const dim3 grid((ne01 + 15) / 16, 1, 1);
         if (src0->type == GGML_TYPE_MXFP4) {
             mul_mat_vec_rp<GGML_TYPE_MXFP4, 16, 16, false, 64, true><<<grid, 1024, 0, stream>>>(
+                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                nullptr, 1, 0, 0, 0,
+                w_gate, x_bias_s, gate_bias_s, glu_op);
+        } else if (src0->type == GGML_TYPE_IQ4_NL) {
+            mul_mat_vec_rp<GGML_TYPE_IQ4_NL, 16, 16, false, 64, true><<<grid, 1024, 0, stream>>>(
+                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                nullptr, 1, 0, 0, 0,
+                w_gate, x_bias_s, gate_bias_s, glu_op);
+        } else if (src0->type == GGML_TYPE_Q5_K) {
+            mul_mat_vec_rp<GGML_TYPE_Q5_K, 16, 16, false, 64, true><<<grid, 1024, 0, stream>>>(
+                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                nullptr, 1, 0, 0, 0,
+                w_gate, x_bias_s, gate_bias_s, glu_op);
+        } else if (src0->type == GGML_TYPE_Q4_K) {
+            mul_mat_vec_rp<GGML_TYPE_Q4_K, 16, 16, false, 64, true><<<grid, 1024, 0, stream>>>(
+                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                nullptr, 1, 0, 0, 0,
+                w_gate, x_bias_s, gate_bias_s, glu_op);
+        } else if (src0->type == GGML_TYPE_Q6_K) {
+            mul_mat_vec_rp<GGML_TYPE_Q6_K, 16, 16, false, 64, true><<<grid, 1024, 0, stream>>>(
                 w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
                 nullptr, 1, 0, 0, 0,
                 w_gate, x_bias_s, gate_bias_s, glu_op);

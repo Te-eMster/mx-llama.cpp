@@ -241,12 +241,15 @@ static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const g
         if (!ok_mm && !ok_mmid) return false;
 
         // Keep in sync with the types ggml_cuda_repack_tensor_supported admits.
-        // The per-type ne0 alignment and the per-lane axis-0 split check follow
-        // from ggml_blck_size below, so per-lane slices that are not
-        // block-aligned correctly stay canonical.
+        // The per-type ne0 alignment (32 for the 32-wide blocks, 256 for the K-quant super-blocks) and the per-lane axis-0 split check follow from ggml_blck_size below, so per-lane slices that are not block-aligned correctly stay canonical.
+        // Lane slices reach the repack buffer as plain contiguous tensors through the accumulating set_tensor path, so every repackable type takes the same road here as Q8_0.
         switch (w->type) {
             case GGML_TYPE_Q8_0:
             case GGML_TYPE_MXFP4:
+            case GGML_TYPE_IQ4_NL:
+            case GGML_TYPE_Q6_K:
+            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q5_K:
                 break;
             default:
                 return false;

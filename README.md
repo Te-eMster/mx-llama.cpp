@@ -15,9 +15,9 @@
 | **Qwen3.8-Flash-Next on `-sm tensor`** | PLE gather table sharded across the TP group (27 GiB on UD-Q4_K_XL, larger at higher quants), NextN/MTP draft head, lazy tensor read under `-lm dio` |
 | **Speculative decoding** | DSpark and DFlash under tensor parallelism, MTP KV staging |
 | **Custom GPU AllReduce** | peer-write, beats the RCCL ring for generation over PCIe |
-| **Q8_0 weight repack** ([iacopPBK](https://github.com/iacopPBK)) | GPU-side weight layout for gfx906, on by default |
+| **Weight repack** | GPU-side weight layout for gfx906, on by default, all split modes: Q8_0, MXFP4, IQ4_NL, Q4_K, Q5_K and Q6_K. Q8_0 path by [iacopPBK](https://github.com/iacopPBK) |
 
-[FEATURES.md](FEATURES.md) - flags, measurements, scope. Base: upstream `b10679`.
+[FEATURES.md](FEATURES.md) - flags, measurements, scope. Base: upstream `b10760`.
 
 ---
 # llama.cpp

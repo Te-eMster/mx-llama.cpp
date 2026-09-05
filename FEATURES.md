@@ -2,7 +2,7 @@
 
 This fork extends upstream llama.cpp with multi-GPU and speculative-decoding
 optimizations. Most additions are backend-generic; the hardware-specific parts
-are the gfx906 (VEGA20) kernel tuning and the Q8_0/MXFP4 weight repack, both
+are the gfx906 (VEGA20) kernel tuning and the weight repack, both
 MI50 / MI60 / Radeon VII class GPUs.
 
 ## Building from source
@@ -248,36 +248,43 @@ The quantized copy is now kept and handed to the later matmuls, which is
 bit-exact. Worth +2.2-2.6% on prefill and decode. On by default;
 `GGML_CUDA_Q8_1_CACHE=0` restores the old behavior. Backend-generic.
 
-## Q8_0 and MXFP4 weight repack (gfx906)
+## Q8_0, MXFP4 and K-quant weight repack (gfx906)
 
-Q8_0 weights upload into a two-plane layout (quants and scales in separate
-planes) with tiled MMQ and mat-vec kernels reading it directly, contributed
-by DENEB1312. On by default on gfx906, carried by the extra buffer types
-like upstream's CPU weight repack, so `--no-repack` disables it; a draft
-model always loads canonical weights. Measured on 2x MI50: prefill +12 to
-+41% across dense and MoE models and both split modes, generation within a
-couple percent of the canonical path. Prefill is bit-exact and perplexity
-unchanged; greedy generation can differ within floating-point
-reassociation. Model load stages canonical bytes and repacks on the
-device, so `-sm layer` loads at vanilla-loader parity and tensor-parallel
-loads within about 1.4x of it. Narrow batches, such as the multi-token
-steps a speculative verify produces, fuse the MoE up and gate lanes and
-size their mat-vec lane group from the tensor shape and the device: a lane
-needs enough accumulation steps to cover its reduction, and the grid that
-results still has to fill the compute units. That puts them at or ahead of
-the canonical path per decode step, worth about 6% on multi-token
-prediction with a 35B MoE. Perplexity is unchanged on MoE and moves within
-floating-point reassociation on dense (6.7010 to 6.6858 on a 27B dense
-model at two tokens), while wide batches stay exact. Validated on gfx906.
+Weights of the types below upload into a repacked layout (quants and scales
+in separate planes, rows de-aliased) that the gfx906 MMQ and mat-vec kernels
+read directly, so prefill stops paying for per-block scale gathers. The Q8_0
+path was contributed by DENEB1312; MXFP4 and the K-quant types follow it
+through per-type kernel traits. On by default on gfx906, carried by the extra
+buffer types like upstream's CPU weight repack, so `--no-repack` disables it
+(`-nr 1` in llama-bench); a draft model always loads canonical weights. Model
+load stages canonical bytes and repacks on the device, so `-sm layer` loads
+at vanilla-loader parity and tensor-parallel loads within about 1.4x of it.
+Every type is admitted under `-sm tensor` and multi-stage `-tps`, where each
+lane slice repacks. VRAM use stays at the canonical size for every type.
 
-MXFP4 weights repack the same way: rows carry the packed nibbles with a
-one-byte e8m0 scale plane after them, staying at the canonical 17 bytes per
-block so VRAM use does not grow. Measured against the canonical path:
-prefill +24% on a 35B MoE (one GPU) and +34% on gpt-oss-120b (two GPUs,
-layer split), generation +19% on a 27B dense model, perplexity within
-0.02%. Narrow batches and decode share the Q8_0 machinery through
-per-type kernel traits: 2-8 token verify batches take one mat-vec per
-expert assignment instead of the tiled GEMM (+41% at four tokens on the
-35B MoE), decode fuses the up and gate lanes (+6% generation on the 35B
-MoE), and tensor-split placement is admitted (+28% prefill on two GPUs
-with `-sm tensor`).
+| type | repacked layout | prefill vs canonical | generation vs canonical | numerics |
+|---|---|---|---|---|
+| Q8_0 | two planes, int8 quants and f16 scales | +12 to +41% (dense and MoE, 2x MI50, both split modes) | within a couple percent | prefill bit-exact, PPL unchanged |
+| MXFP4 | packed nibbles, one-byte e8m0 scale plane | +24% (35B MoE, 1 GPU), +34% (gpt-oss-120b, 2 GPU layer), +28% (2 GPU tensor) | +19% (27B dense) | PPL within 0.02% |
+| IQ4_NL | nibble plane, f16 scale plane, k-value table | +133% (1 GPU), +112% (2 GPU tensor) | +5% (1 GPU), -2% (2 GPU tensor) | byte-identical boots, PPL 7.4748 vs 7.4741 |
+| Q6_K | de-aliased lows, highs plane, per-16 scale pairs, f16 d plane | +69% (1 GPU), +59% (2 GPU tensor) | +6% (1 GPU), -2% (2 GPU tensor) | byte-identical boots, PPL 7.3822 vs 7.3823 |
+| Q5_K_M | Q4_K planes plus a fifth-bit word per sub-block | +55% (1 GPU), +50% (2 GPU tensor) | +1% (1 GPU), -5% (2 GPU tensor) | byte-identical boots, PPL 7.4895 vs 7.4929 |
+| Q4_K_M | de-aliased nibbles, scale/min record, half2 d and dmin | +2% (1 GPU), +5% (2 GPU tensor) | +7% (1 GPU), -2% (2 GPU tensor) | byte-identical boots, PPL 7.4319 vs 7.4267 |
+
+The K-quant rows are Qwen3-14B on MI50, pp512, tg128, one card in layer
+mode and two cards with `-sm tensor -tps 2`; Q4_K and Q5_K carry the affine
+scale and min pair and fold the activation sum through the q8_1 block sums.
+Greedy generation can differ from the canonical kernels within
+floating-point reassociation on every type.
+
+Narrow batches, such as the multi-token steps a speculative verify produces,
+fuse the MoE up and gate lanes and size their mat-vec lane group from the
+tensor shape and the device: a lane needs enough accumulation steps to cover
+its reduction, and the grid that results still has to fill the compute
+units. That puts them at or ahead of the canonical path per decode step,
+worth about 6% on multi-token prediction with a 35B MoE; 2-8 token verify
+batches take one mat-vec per expert assignment instead of the tiled GEMM
+(+41% at four tokens on the 35B MoE). Perplexity is unchanged on MoE and
+moves within floating-point reassociation on dense (6.7010 to 6.6858 on a
+27B dense model at two tokens), while wide batches stay exact. Validated on
+gfx906.
