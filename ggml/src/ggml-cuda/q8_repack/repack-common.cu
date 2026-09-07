@@ -3,6 +3,8 @@
 #include "repack.cuh"
 #include "repack-common.cuh"
 
+#include <cstdlib>
+
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -62,6 +64,21 @@ bool ggml_cuda_repack_mmv_fusion_supported(const ggml_tensor * src0) {
     const ggml_tensor * t = src0->view_src != nullptr ? src0->view_src : src0;
     return (t->type == GGML_TYPE_Q8_0 || t->type == GGML_TYPE_MXFP4) &&
            ggml_cuda_repack_mul_mat_should_fire(src0);
+}
+
+// The MoE up/gate fusion has a fused mat-vec for every repacked type, so the expert path admits all of them.
+// The dense fusion stays on the predicate above until its K-quant and bias variants have their own gate.
+// GGML_CUDA_REPACK_KQUANT_MOE_FUSION=0 keeps the expert path on the Q8_0 and MXFP4 admission.
+bool ggml_cuda_repack_mmv_id_fusion_supported(const ggml_tensor * src0) {
+    static const bool kquant = [] {
+        const char * env = getenv("GGML_CUDA_REPACK_KQUANT_MOE_FUSION");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    const ggml_tensor * t = src0->view_src != nullptr ? src0->view_src : src0;
+    const bool base = t->type == GGML_TYPE_Q8_0 || t->type == GGML_TYPE_MXFP4;
+    // Each of these four types has been gated on a real MoE model: deterministic, unfused path unchanged, width-1 PPL within the repack's own spread.
+    const bool kq   = t->type == GGML_TYPE_Q4_K || t->type == GGML_TYPE_Q5_K || t->type == GGML_TYPE_Q6_K || t->type == GGML_TYPE_IQ4_NL;
+    return (base || (kquant && kq)) && ggml_cuda_repack_mul_mat_should_fire(src0);
 }
 
 // Host repack of one Q8_0 matrix: qs plane [ne1 x nsp x 32] then f16 scale plane

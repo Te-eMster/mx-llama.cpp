@@ -33,6 +33,10 @@ inline bool ggml_cuda_repack_mmv_fusion_supported(const ggml_tensor *) {
     return false;
 }
 
+inline bool ggml_cuda_repack_mmv_id_fusion_supported(const ggml_tensor *) {
+    return false;
+}
+
 inline void ggml_cuda_mul_mat_repacked(
         ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) {
     GGML_ABORT("repacked weights are unavailable on MUSA");
@@ -76,8 +80,11 @@ void ggml_cuda_repack_set_tensor_async(int device, cudaStream_t stream,
     ggml_tensor * tensor, const void * data, size_t offset, size_t size);
 void ggml_cuda_repack_async_release(int device);
 
-// Fused MMV is Q8_0-only (it uses the mat-vec kernel, which has no MXFP4 port).
+// Dense fused MMV admits Q8_0 and MXFP4 only.
 bool ggml_cuda_repack_mmv_fusion_supported(const ggml_tensor * src0);
+
+// The MoE (mul_mat_id) fused MMV admits Q8_0, MXFP4 and, behind GGML_CUDA_REPACK_KQUANT_MOE_FUSION, the Q4_K, Q5_K, Q6_K and IQ4_NL expert weights.
+bool ggml_cuda_repack_mmv_id_fusion_supported(const ggml_tensor * src0);
 
 void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);

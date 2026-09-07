@@ -288,3 +288,18 @@ batches take one mat-vec per expert assignment instead of the tiled GEMM
 moves within floating-point reassociation on dense (6.7010 to 6.6858 on a
 27B dense model at two tokens), while wide batches stay exact. Validated on
 gfx906.
+
+The fused up and gate mat-vec also admits Q4_K, Q5_K, Q6_K and IQ4_NL expert
+weights, on by default, `GGML_CUDA_REPACK_KQUANT_MOE_FUSION=0` turns it off.
+Qwen3.6-35B-A3B on one MI50, tg128 against the unfused path: Q4_K_M 80.9 ->
+86.6 t/s (+7.1%), Q5_K_M 76.7 -> 83.1 (+8.4%), Q6_K 75.5 -> 81.2 (+7.5%),
+IQ4_NL 84.8 -> 89.8 (+5.9%); two MI50 with `-sm layer` 74.5 -> 79.6 (+6.8%);
+prefill unchanged; with `-sm tensor` the gain is within run-to-run spread
+because the per-card slice shrinks while the AllReduce does not. Dense
+models and Q8_0 experts are untouched (within 1%). The fused kernels are
+bit-identical to the unfused ones at batch widths 2 to 4 and differ at
+width 1 by reduction order: perplexity scored one token at a time over ten
+2048-token chunks moves by 0.1 to 0.3% per type, inside the spread the
+repack itself has against the canonical kernels. Multi-token prediction
+output is unchanged. `GGML_CUDA_REPACK_MOE_FUSION_STATS=1` prints a
+per-width histogram of fused launches.
