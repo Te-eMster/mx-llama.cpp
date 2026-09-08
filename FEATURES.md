@@ -270,6 +270,7 @@ lane slice repacks. VRAM use stays at the canonical size for every type.
 | Q6_K | de-aliased lows, highs plane, per-16 scale pairs, f16 d plane | +69% (1 GPU), +59% (2 GPU tensor) | +6% (1 GPU), -2% (2 GPU tensor) | byte-identical boots, PPL 7.3822 vs 7.3823 |
 | Q5_K_M | Q4_K planes plus a fifth-bit word per sub-block | +55% (1 GPU), +50% (2 GPU tensor) | +1% (1 GPU), -5% (2 GPU tensor) | byte-identical boots, PPL 7.4895 vs 7.4929 |
 | Q4_K_M | de-aliased nibbles, scale/min record, half2 d and dmin | +2% (1 GPU), +5% (2 GPU tensor) | +7% (1 GPU), -2% (2 GPU tensor) | byte-identical boots, PPL 7.4319 vs 7.4267 |
+| Q5_1 | nibble plane, fifth-bit word, half2 d and m | +84% (1 GPU), +74% (2 GPU tensor) | flat (1 GPU and 2 GPU tensor) | byte-identical output on 1 GPU, PPL 6.6031 vs 6.6351 |
 
 The K-quant rows are Qwen3-14B on MI50, pp512, tg128, one card in layer
 mode and two cards with `-sm tensor -tps 2`; Q4_K and Q5_K carry the affine
