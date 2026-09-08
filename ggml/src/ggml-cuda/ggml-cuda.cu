@@ -4441,6 +4441,16 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// The fusion and its allocation dependencies are switched together, they are not sound apart.
+// GGML_CUDA_MOE_WEIGHTED_REDUCTION=0 selects the unfused MUL and ADD chain.
+static bool ggml_cuda_moe_weighted_reduction_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_MOE_WEIGHTED_REDUCTION");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4451,7 +4461,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
-    if (node->op == GGML_OP_MUL) {
+    if (node->op == GGML_OP_MUL && ggml_cuda_moe_weighted_reduction_enabled()) {
         ggml_cuda_moe_weighted_reduction_match match;
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
             const int output_idx = i + match.node_count - 1;
@@ -5642,7 +5652,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
-    if (!disable_fusion) {
+    if (!disable_fusion && ggml_cuda_moe_weighted_reduction_enabled()) {
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             if (cgraph->nodes[i]->op != GGML_OP_MUL) {
                 continue;
