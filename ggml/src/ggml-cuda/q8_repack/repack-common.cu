@@ -27,6 +27,10 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
             // whole super-blocks, and no views: the multi-plane layouts have no view splice yet
             return t->ne[0] % 256 == 0 && t->view_src == nullptr;
         }
+        case GGML_TYPE_Q5_1: {
+            // 32-value blocks, multi-plane like the K-quants, so no view splice either
+            return t->ne[0] % 32 == 0 && t->view_src == nullptr;
+        }
         default:             return false;
     }
 }
@@ -277,6 +281,28 @@ void repack_q5k_host(const block_q5_K * blocks, uint8_t * dst, const int64_t ne0
     }
 }
 
+// Host repack of one Q5_1 matrix: the canonical nibble bytes and fifth-bit word per block are already in plane order, so the three planes are copies.
+void repack_q51_host(const block_q5_1 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1) {
+    GGML_ASSERT(ne0 % 32 == 0);
+    const int64_t n_sub  = ne0 / 32;
+    const int64_t qs_str = repack_qs_row_stride(GGML_TYPE_Q5_1, ne0);
+    const size_t  hoff   = (size_t) ne1 * qs_str;
+    const size_t  doff   = hoff + (size_t) ne1 * n_sub * 4;
+
+    memset(dst, 0, doff + (size_t) ne1 * n_sub * 4);
+
+    for (int64_t row = 0; row < ne1; row++) {
+        const block_q5_1 * brow = blocks + row * n_sub;
+        for (int64_t sb = 0; sb < n_sub; sb++) {
+            const block_q5_1 * b = &brow[sb];
+            const size_t wi = (size_t) row * n_sub + sb;
+            memcpy(dst + (size_t) row * qs_str + (size_t) sb * 16, b->qs, 16);
+            memcpy(dst + hoff + wi * 4, b->qh, 4);
+            memcpy(dst + doff + wi * 4, &b->dm, 4);
+        }
+    }
+}
+
 void repack_host(ggml_type type, const void * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1) {
     switch (type) {
         case GGML_TYPE_Q8_0:
@@ -296,6 +322,9 @@ void repack_host(ggml_type type, const void * blocks, uint8_t * dst, const int64
             break;
         case GGML_TYPE_Q5_K:
             repack_q5k_host((const block_q5_K *) blocks, dst, ne0, ne1);
+            break;
+        case GGML_TYPE_Q5_1:
+            repack_q51_host((const block_q5_1 *) blocks, dst, ne0, ne1);
             break;
         default:
             GGML_ABORT("unsupported repack type");
@@ -331,7 +360,7 @@ const uint8_t * repack_view_get_cached(
         const ggml_tensor * view, const ggml_tensor * base,
         cudaStream_t stream) {
     // the K-quant multi-plane layouts have no view splice: supports() refuses their views
-    GGML_ASSERT(base->type != GGML_TYPE_Q6_K && base->type != GGML_TYPE_Q4_K && base->type != GGML_TYPE_Q5_K && "repack: K-quant views are not spliced");
+    GGML_ASSERT(base->type != GGML_TYPE_Q6_K && base->type != GGML_TYPE_Q4_K && base->type != GGML_TYPE_Q5_K && base->type != GGML_TYPE_Q5_1 && "repack: multi-plane views are not spliced");
     const int64_t ne0_v = view->ne[0];
     const int64_t ne1_v = view->ne[1];
     const int64_t ne2_v = view->ne[2];

@@ -250,6 +250,7 @@ static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const g
             case GGML_TYPE_Q6_K:
             case GGML_TYPE_Q4_K:
             case GGML_TYPE_Q5_K:
+            case GGML_TYPE_Q5_1:
                 break;
             default:
                 return false;

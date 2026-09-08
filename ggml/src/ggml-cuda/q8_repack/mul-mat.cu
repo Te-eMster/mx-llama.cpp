@@ -81,6 +81,10 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
                         ggml_cuda_mul_mat_repacked_nc_t<GGML_TYPE_IQ4_NL>(w, xq, dst_d,
                             ne00, ne01, ne11, (uint32_t) x_stride, dst_s1, stream);
                         break;
+                    case GGML_TYPE_Q5_1:
+                        ggml_cuda_mul_mat_repacked_nc_t<GGML_TYPE_Q5_1>(w, xq, dst_d,
+                            ne00, ne01, ne11, (uint32_t) x_stride, dst_s1, stream);
+                        break;
                     case GGML_TYPE_Q5_K:
                         ggml_cuda_mul_mat_repacked_nc_t<GGML_TYPE_Q5_K>(w, xq, dst_d,
                             ne00, ne01, ne11, (uint32_t) x_stride, dst_s1, stream);
@@ -306,6 +310,12 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
                     nullptr, 0, 0, 0, 1, 0, 0, 0);
             } break;
+            case GGML_TYPE_Q5_1: {
+                const dim3 grid((ne01 + 15) / 16, 1, 1);
+                mul_mat_vec_rp<GGML_TYPE_Q5_1, 16, 16, false><<<grid, 1024, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                    nullptr, 0, 0, 0, 1, 0, 0, 0);
+            } break;
             case GGML_TYPE_Q5_K: {
                 const dim3 grid((ne01 + 15) / 16, 1, 1);
                 mul_mat_vec_rp<GGML_TYPE_Q5_K, 16, 16, false><<<grid, 1024, 0, stream>>>(
@@ -352,6 +362,11 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
                     nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
                 break;
+            case GGML_TYPE_Q5_1:
+                mmq_gemm_repacked<false, MMQ_RP_Q8_TN, nrl, GGML_TYPE_Q5_1><<<grid, dim3(64, nrl), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
+                    nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+                break;
             case GGML_TYPE_Q5_K:
                 mmq_gemm_repacked<false, MMQ_RP_Q8_TN, nrl, GGML_TYPE_Q5_K><<<grid, dim3(64, nrl), 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
@@ -386,6 +401,11 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                 break;
             case GGML_TYPE_IQ4_NL:
                 mmq_gemm_repacked_w32<false, 1, nrl*2, GGML_TYPE_IQ4_NL><<<grid, dim3(32, nrl*2), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
+                    nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+                break;
+            case GGML_TYPE_Q5_1:
+                mmq_gemm_repacked_w32<false, 1, nrl*2, GGML_TYPE_Q5_1><<<grid, dim3(32, nrl*2), 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
                     nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
                 break;
