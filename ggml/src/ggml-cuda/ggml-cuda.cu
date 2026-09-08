@@ -38,6 +38,20 @@
 // GGML_CUDA_REPACK_MOE_FUSION_STATS=1 prints the non-zero cells every 8192 launches and at process exit.
 static std::atomic<uint64_t> g_repack_moe_fusion_hist[GGML_TYPE_COUNT][65];
 
+// The repack fused epilogue implements SWIGLU, GEGLU, and SWIGLU_OAI at its fixed alpha 1.702 and limit 7.0.
+// Anything else keeps its own GLU node.
+static bool ggml_cuda_repack_fusion_glu_ok(const ggml_tensor * glu) {
+    switch (ggml_get_glu_op(glu)) {
+        case GGML_GLU_OP_SWIGLU:
+        case GGML_GLU_OP_GEGLU:
+            return true;
+        case GGML_GLU_OP_SWIGLU_OAI:
+            return ggml_get_op_params_f32(glu, 2) == 1.702f && ggml_get_op_params_f32(glu, 3) == 7.0f;
+        default:
+            return false;
+    }
+}
+
 static void ggml_cuda_repack_moe_fusion_dump() {
     for (int t = 0; t < GGML_TYPE_COUNT; t++) {
         for (int c = 0; c <= 64; c++) {
@@ -4964,6 +4978,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (ggml_cuda_repack_mul_mat_should_fire(src0) &&
                 ggml_cuda_repack_mul_mat_should_fire(gate->src[0]) &&
                 fusion_types_ok &&
+                ggml_cuda_repack_fusion_glu_ok(glu) &&
                 ggml_cuda_repack_mmv_fusion_width_ok(
                     ids == nullptr ? glu->ne[1] : glu->ne[2], ids != nullptr, src0->type)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
