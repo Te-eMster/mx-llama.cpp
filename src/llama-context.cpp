@@ -110,6 +110,13 @@ llama_context::llama_context(
         LLAMA_LOG_DEBUG("%s: n_rs_seq=%u requested but model does not support recurrent partial rollback; clamping to 0\n",
                         __func__, cparams.n_rs_seq);
         cparams.n_rs_seq = 0;
+    } else if (cparams.n_rs_seq > 0 && model.arch == LLM_ARCH_QWEN4EXP && cparams.n_seq_max > 1) {
+        // The snapshot ring currently has no cross-sequence plane-copy planner.
+        // Keep multi-slot Qwen4exp on the no-rollback behavior instead of using the unproven plane-indexed path.
+        LLAMA_LOG_WARN(
+                "%s: qwen4exp recurrent rollback currently requires n_seq_max=1; clamping n_rs_seq to 0\n",
+                __func__);
+        cparams.n_rs_seq = 0;
     }
 
     cparams.n_threads               = params.n_threads;
@@ -249,6 +256,16 @@ llama_context::llama_context(
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+
+    const uint64_t n_ubatch_min_rs = (uint64_t) cparams.n_rs_seq + 2;
+    if (cparams.n_rs_seq > 0 && cparams.n_ubatch < n_ubatch_min_rs) {
+        // split_equal() must keep the trailing (n_rs_seq + 1) tokens in one ubatch.
+        // Preserve the requested physical batch cap and use the existing full-state checkpoint fallback instead of aborting inside the batch allocator.
+        LLAMA_LOG_WARN("%s: recurrent partial rollback with n_rs_seq=%u requires n_ubatch >= %" PRIu64
+                "; n_ubatch=%u, clamping n_rs_seq to 0; full-state checkpoints are required\n",
+                __func__, cparams.n_rs_seq, n_ubatch_min_rs, cparams.n_ubatch);
+        cparams.n_rs_seq = 0;
+    }
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
@@ -1756,9 +1773,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
+        if (mctx) {
+            mctx->finish_compute(false);
+        }
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    if (mctx) {
+        mctx->finish_compute(true);
     }
 
     if (graph_sequence_layout_changed) {

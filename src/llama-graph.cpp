@@ -347,20 +347,96 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
     }
 }
 
-void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
-    GGML_UNUSED(ubatch);
-
-    const int64_t n_rs = mctx->get_n_rs();
-
-    if (s_copy) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(s_copy->buffer));
-        int32_t * data = (int32_t *) s_copy->data;
-
-        // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
-        for (uint32_t i = 0; i < n_rs; ++i) {
-            data[i] = mctx->s_copy(i);
-        }
+void llm_graph_input_rs::fill_s_write(
+        const llama_ubatch * ubatch, const llama_memory_recurrent_context * m) {
+    if (m == nullptr || ubatch == nullptr || !m->uses_ring() || n_snap <= 0) {
+        return;
     }
+
+    bool has_sink = (s_write != nullptr && s_write->buffer != nullptr) ||
+                    (s_write_conv != nullptr && s_write_conv->buffer != nullptr);
+    for (size_t snap = 0; !has_sink && snap < s_write_slices.size(); ++snap) {
+        has_sink = s_write_slices[snap] != nullptr && s_write_slices[snap]->buffer != nullptr;
+    }
+    if (!has_sink) {
+        return;
+    }
+
+    GGML_ASSERT((int64_t) s_write_slices.size() == n_snap);
+
+    std::vector<int32_t> rows((size_t) ubatch->n_seqs * (size_t) n_snap);
+    m->plan_snapshot_writes(rows.data(), ubatch->n_seqs, (uint32_t) n_snap);
+
+    if (s_write != nullptr && s_write->buffer != nullptr) {
+        ggml_backend_tensor_set(s_write, rows.data(), 0, rows.size() * sizeof(int32_t));
+    }
+
+    if (s_write_conv != nullptr && s_write_conv->buffer != nullptr) {
+        std::vector<int32_t> rows_conv(rows.size());
+        for (uint32_t seq = 0; seq < ubatch->n_seqs; ++seq) {
+            for (int64_t snap = 0; snap < n_snap; ++snap) {
+                rows_conv[(size_t) seq * (size_t) n_snap + (size_t) snap] =
+                    rows[((size_t) n_snap - 1 - (size_t) snap) * (size_t) ubatch->n_seqs + seq];
+            }
+        }
+        ggml_backend_tensor_set(
+                s_write_conv, rows_conv.data(), 0, rows_conv.size() * sizeof(int32_t));
+    }
+
+    for (size_t snap = 0; snap < s_write_slices.size(); ++snap) {
+        ggml_tensor * slice = s_write_slices[snap];
+        GGML_ASSERT(slice != nullptr);
+        if (slice->buffer == nullptr) {
+            continue;
+        }
+        GGML_ASSERT(slice->ne[0] == (int64_t) ubatch->n_seqs);
+        ggml_backend_tensor_set(slice, rows.data() + snap * ubatch->n_seqs, 0,
+                (size_t) ubatch->n_seqs * sizeof(int32_t));
+    }
+}
+
+void llm_graph_input_rs::upload_s_copy(
+        const llama_memory_recurrent_context * m, int64_t n_seqs_ub) {
+    const int64_t n_rs = m->get_n_rs();
+    if (n_rs <= 0) {
+        return;
+    }
+
+    const bool has_sink =
+        (s_copy != nullptr && s_copy->buffer != nullptr) ||
+        (s_copy_main != nullptr && s_copy_main->view_src == nullptr && s_copy_main->buffer != nullptr) ||
+        (s_copy_extra != nullptr && s_copy_extra->view_src == nullptr && s_copy_extra->ne[0] > 0 &&
+            s_copy_extra->buffer != nullptr);
+    if (!has_sink) {
+        return;
+    }
+
+    std::vector<int32_t> rows((size_t) n_rs);
+    const int64_t row_limit = (int64_t) m->get_size() * (int64_t) m->get_n_planes();
+    for (int64_t i = 0; i < n_rs; ++i) {
+        rows[i] = m->s_copy((int) i);
+        GGML_ASSERT(rows[i] >= 0 && (int64_t) rows[i] < row_limit);
+    }
+
+    if (s_copy != nullptr && s_copy->buffer != nullptr) {
+        ggml_backend_tensor_set(s_copy, rows.data(), 0, rows.size() * sizeof(int32_t));
+    }
+    if (s_copy_main != nullptr && s_copy_main->view_src == nullptr && s_copy_main->buffer != nullptr) {
+        GGML_ASSERT(s_copy_main->ne[0] == std::min(n_seqs_ub, n_rs));
+        ggml_backend_tensor_set(s_copy_main, rows.data(), 0,
+                (size_t) s_copy_main->ne[0] * sizeof(int32_t));
+    }
+    if (s_copy_extra != nullptr && s_copy_extra->view_src == nullptr && s_copy_extra->ne[0] > 0 &&
+            s_copy_extra->buffer != nullptr) {
+        GGML_ASSERT(s_copy_extra->ne[0] == n_rs - n_seqs_ub);
+        ggml_backend_tensor_set(s_copy_extra, rows.data() + n_seqs_ub, 0,
+                (size_t) s_copy_extra->ne[0] * sizeof(int32_t));
+    }
+}
+
+void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
+    upload_s_copy(mctx, ubatch != nullptr ? (int64_t) ubatch->n_seqs : 0);
+    fill_s_write(ubatch, mctx);
 }
 
 bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
@@ -377,6 +453,25 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
+
+    if (mctx->uses_ring()) {
+        const int64_t n_snap_now = std::min<int64_t>(
+                (int64_t) params.ubatch.n_seq_tokens, (int64_t) mctx->get_n_planes());
+        if (s_write == nullptr || n_snap != n_snap_now ||
+                s_write->ne[0] != (int64_t) params.ubatch.n_seqs * n_snap_now ||
+                s_write_conv == nullptr ||
+                s_write_conv->ne[0] != (int64_t) params.ubatch.n_seqs * n_snap_now ||
+                (int64_t) s_write_slices.size() != n_snap_now) {
+            return false;
+        }
+        for (ggml_tensor * slice : s_write_slices) {
+            if (slice == nullptr || slice->ne[0] != (int64_t) params.ubatch.n_seqs) {
+                return false;
+            }
+        }
+    } else {
+        res &= s_write == nullptr && s_write_conv == nullptr;
+    }
 
     return res;
 }
@@ -1122,21 +1217,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
         mctx->get_attn()->set_input_v_rot(inp_attn->self_v_rot);
     }
 
-    const int64_t n_rs = mctx->get_recr()->get_n_rs();
-
-    // A sub-context can hold no recurrent layers at all - an MTP draft context runs a
-    // single full-attention block, so the recurrent filter admits nothing and s_copy is
-    // created but never allocated. Nothing to copy then, so skip rather than dereference
-    // a tensor the allocator never backed.
-    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
-        int32_t * data = (int32_t *) inp_rs->s_copy->data;
-
-        // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
-        for (uint32_t i = 0; i < n_rs; ++i) {
-            data[i] = mctx->get_recr()->s_copy(i);
-        }
-    }
+    inp_rs->upload_s_copy(mctx->get_recr(), ubatch->n_seqs);
+    inp_rs->fill_s_write(ubatch, mctx->get_recr());
 }
 
 bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
@@ -1159,6 +1241,15 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
 
+    if (mctx->get_recr()->uses_ring()) {
+        const int64_t n_snap = std::min<int64_t>(params.ubatch.n_seq_tokens, mctx->get_recr()->get_n_planes());
+        if (inp_rs->s_write == nullptr || inp_rs->n_snap != n_snap ||
+                inp_rs->s_write->ne[0] != (int64_t) params.ubatch.n_seqs * n_snap ||
+                (int64_t) inp_rs->s_write_slices.size() != n_snap) {
+            return false;
+        }
+    }
+
     return res;
 }
 
@@ -1170,21 +1261,8 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
 
     mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
 
-    const int64_t n_rs = mctx->get_recr()->get_n_rs();
-
-    // A sub-context can hold no recurrent layers at all - an MTP draft context runs a
-    // single full-attention block, so the recurrent filter admits nothing and s_copy is
-    // created but never allocated. Nothing to copy then, so skip rather than dereference
-    // a tensor the allocator never backed.
-    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
-        int32_t * data = (int32_t *) inp_rs->s_copy->data;
-
-        // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
-        for (uint32_t i = 0; i < n_rs; ++i) {
-            data[i] = mctx->get_recr()->s_copy(i);
-        }
-    }
+    inp_rs->upload_s_copy(mctx->get_recr(), ubatch->n_seqs);
+    inp_rs->fill_s_write(ubatch, mctx->get_recr());
 }
 
 bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
@@ -1205,6 +1283,15 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+
+    if (mctx->get_recr()->uses_ring()) {
+        const int64_t n_snap = std::min<int64_t>(params.ubatch.n_seq_tokens, mctx->get_recr()->get_n_planes());
+        if (inp_rs->s_write == nullptr || inp_rs->n_snap != n_snap ||
+                inp_rs->s_write->ne[0] != (int64_t) params.ubatch.n_seqs * n_snap ||
+                (int64_t) inp_rs->s_write_slices.size() != n_snap) {
+            return false;
+        }
+    }
 
     return res;
 }
@@ -1248,21 +1335,8 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
         attn_ctx->get_swa()->set_input_v_rot(inp_attn->self_v_rot_swa);
     }
 
-    const int64_t n_rs = mctx->get_recr()->get_n_rs();
-
-    // A sub-context can hold no recurrent layers at all - an MTP draft context runs a
-    // single full-attention block, so the recurrent filter admits nothing and s_copy is
-    // created but never allocated. Nothing to copy then, so skip rather than dereference
-    // a tensor the allocator never backed.
-    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
-        int32_t * data = (int32_t *) inp_rs->s_copy->data;
-
-        // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
-        for (uint32_t i = 0; i < n_rs; ++i) {
-            data[i] = mctx->get_recr()->s_copy(i);
-        }
-    }
+    inp_rs->upload_s_copy(mctx->get_recr(), ubatch->n_seqs);
+    inp_rs->fill_s_write(ubatch, mctx->get_recr());
 }
 
 bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params) {
@@ -1297,6 +1371,15 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+
+    if (mctx->get_recr()->uses_ring()) {
+        const int64_t n_snap = std::min<int64_t>(params.ubatch.n_seq_tokens, mctx->get_recr()->get_n_planes());
+        if (inp_rs->s_write == nullptr || inp_rs->n_snap != n_snap ||
+                inp_rs->s_write->ne[0] != (int64_t) params.ubatch.n_seqs * n_snap ||
+                (int64_t) inp_rs->s_write_slices.size() != n_snap) {
+            return false;
+        }
+    }
 
     return res;
 }
@@ -3544,8 +3627,34 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
     inp->s_copy = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
     ggml_set_input(inp->s_copy);
 
-    inp->s_copy_main  = ggml_view_1d(ctx0, inp->s_copy, n_seqs, 0);
-    inp->s_copy_extra = ggml_view_1d(ctx0, inp->s_copy, n_rs - n_seqs, n_seqs * inp->s_copy->nb[0]);
+    if (mctx_cur->uses_ring()) {
+        inp->n_snap = std::min<int64_t>(ubatch.n_seq_tokens, mctx_cur->get_n_planes());
+        inp->s_write = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_seqs * inp->n_snap);
+        ggml_set_input(inp->s_write);
+        inp->s_write_conv = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_seqs * inp->n_snap);
+        ggml_set_name(inp->s_write_conv, "s_write_conv");
+        ggml_set_input(inp->s_write_conv);
+
+        inp->s_write_slices.resize((size_t) inp->n_snap);
+        for (int64_t snap = 0; snap < inp->n_snap; ++snap) {
+            ggml_tensor * slice = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_seqs);
+            ggml_format_name(slice, "s_write_slice_%lld", (long long) snap);
+            ggml_set_input(slice);
+            inp->s_write_slices[snap] = slice;
+        }
+    }
+
+    inp->s_copy_main = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_seqs);
+    ggml_set_name(inp->s_copy_main, "s_copy_main");
+    ggml_set_input(inp->s_copy_main);
+
+    if (n_rs > n_seqs) {
+        inp->s_copy_extra = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs - n_seqs);
+        ggml_set_name(inp->s_copy_extra, "s_copy_extra");
+        ggml_set_input(inp->s_copy_extra);
+    } else {
+        inp->s_copy_extra = ggml_view_1d(ctx0, inp->s_copy, 0, n_seqs * inp->s_copy->nb[0]);
+    }
 
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();

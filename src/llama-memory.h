@@ -64,6 +64,11 @@ struct llama_memory_context_i {
 
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
+
+    // finish the current graph-compute transaction.
+    // Most memory types mutate only in apply() and need no action here.
+    // recurrent snapshot rings also stage host-side row mappings in set_input(), before graph execution is known to have succeeded.
+    virtual void finish_compute(bool success) { (void) success; }
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;

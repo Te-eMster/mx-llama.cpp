@@ -180,16 +180,32 @@ static void launch_gated_delta_net(
         float scale, int64_t state_slot_stride, int K, cudaStream_t stream) {
     const int CS = KDA ? 16 : 64;
 
-    if constexpr (!keep_rs_t) {
-        if (n_tokens >= 2 * CS && S_v <= 128) {
-            launch_gated_delta_net_chunk<KDA, keep_rs_t>(
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
-                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3,
-                sv1, sv2, sv3, sb1, sb2, sb3,
-                neqk1, rq3, scale, K, stream);
-            return;
+    // The chunked kernel emits per-token snapshots, so retained-state prefill no longer needs serial arithmetic.
+    // The opt-out is for diagnosis and does not change ring-off calls.
+    static const bool chunk_snap_off = [] {
+        const char * value = getenv("LLAMA_GDN_NO_CHUNK_SNAPSHOTS");
+        return value != nullptr && atoi(value) != 0;
+    }();
+    const bool chunk_eligible = n_tokens >= 2 * CS && S_v <= 128;
+
+    static bool chunk_snap_announced = false;
+    if constexpr (keep_rs_t) {
+        if (chunk_eligible && !chunk_snap_announced) {
+            chunk_snap_announced = true;
+            GGML_LOG_WARN("%s: gdn-chunk-snapshots: keep_rs chunked path %s\n",
+                    __func__, chunk_snap_off ? "SUPPRESSED by LLAMA_GDN_NO_CHUNK_SNAPSHOTS" :
+                                              "TAKEN (default)");
         }
-    } 
+    }
+
+    if (chunk_eligible && (!keep_rs_t || !chunk_snap_off)) {
+        launch_gated_delta_net_chunk<KDA, keep_rs_t>(
+            q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+            S_v, H, n_tokens, n_seqs, sq1, sq2, sq3,
+            sv1, sv2, sv3, sb1, sb2, sb3,
+            neqk1, rq3, scale, K, stream);
+        return;
+    }
 
     const int device = ggml_cuda_get_device();
     const int warp_size = ggml_cuda_info().devices[device].warp_size;
