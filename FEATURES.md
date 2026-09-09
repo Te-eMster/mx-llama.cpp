@@ -89,6 +89,24 @@ KV staging, a KV-only prefill replay, disabling the draft context's pipeline rin
 and a non-finite-draft fail-safe. Default off uses the standard `draft-mtp` path
 with these disabled. Backend-generic.
 
+## Recurrent state rollback (snapshot ring)
+
+Recurrent and hybrid models checkpointed their state by whole planes, so a rejected
+speculative draft had no cheap way back and the state was rebuilt rather than rewound.
+That is what made MTP drafting on a delta-net model cost more than it saved. Each
+sequence now keeps its snapshots in a ring of physical planes with a head and a valid
+depth, the delta-net kernels scatter per-token snapshot rows as they run, and a graph
+that fails invalidates the affected sequences instead of leaving a half-written plane
+visible. Measured on 4x MI50 with Qwen3.8-Flash-Next MTP UD-Q4_K_XL, 554-token prompt
+at draft depth 2: speculative generation 29.8 to 42.4 t/s on `-sm layer` and 16.4 to
+42.5 t/s on `-sm tensor`, where before the change speculating was slower than not
+speculating at all. Plain generation goes 30.3 to 31.4 t/s with byte-identical output,
+and Qwen3.6-35B-A3B-Q4_K_M single-GPU prefill is unchanged, 955 to 953 (guardrail). No
+flag: rollback engages when a caller asks for it with a single sequence, and it is
+clamped off above one sequence and below a minimum micro-batch with a warning. It lives
+in the recurrent memory layer, so every delta-net model shares it. Backend-generic, the
+delta-net kernels are validated on gfx906.
+
 ## Concurrent lane dispatch
 
 Under `-sm tensor` the meta backend issued each subgraph to its GPUs in device
@@ -152,12 +170,22 @@ the loader maps lazily-read tensors even under `-lm dio`: the mapping is virtual
 prefetch is zero and the range is never populated, which avoids whole-model mmap's
 page thrashing while still letting the table be demand paged.
 
+The table can instead be warmed at load: `LLAMA_PLE_PREFAULT=1` touches one byte per
+page of it from eight threads once the weights are in, so the first request does not
+fault the rows in one at a time. That moves the read out of the first request and into
+load time, so how much it is worth is bounded by storage throughput, and it buys
+nothing once the table is already in page cache - it pays on a fresh process, not on a
+warm one. The log line reports the size touched and how long it took, so the cost is
+visible per machine. Off by default, inert when the table is not host resident, and it
+uses no VRAM.
+
 A NextN/MTP draft head is supported with `--spec-type draft-mtp`, converted by
 `convert_hf_to_gguf.py --mtp`. Draft acceptance runs 75-90 percent at `n_max 2` and
-is strongly text dependent (46 to 90 percent across prompts). Whether it is a net
-throughput win depends on the split mode - under `-sm tensor` the multi-GPU verify
-costs more than the drafting saves, while `-sm layer` lands near parity - so measure
-on your own topology before enabling it.
+is strongly text dependent (46 to 90 percent across prompts). With the recurrent
+snapshot ring above it is a throughput win in both split modes on this quant - see
+that section for the numbers - where previously the multi-GPU verify under `-sm tensor`
+cost more than the drafting saved. Acceptance still tracks the text, so measure on your
+own prompts.
 
 ## Shared-expert tensor-parallel split
 
@@ -248,14 +276,15 @@ The quantized copy is now kept and handed to the later matmuls, which is
 bit-exact. Worth +2.2-2.6% on prefill and decode. On by default;
 `GGML_CUDA_Q8_1_CACHE=0` restores the old behavior. Backend-generic.
 
-## Q8_0, MXFP4 and K-quant weight repack (gfx906)
+## Q8_0, MXFP4, K-quant and Q5_1 weight repack (gfx906)
 
 Weights of the types below upload into a repacked layout (quants and scales
 in separate planes, rows de-aliased) that the gfx906 MMQ and mat-vec kernels
 read directly, so prefill stops paying for per-block scale gathers. The Q8_0
-path was contributed by DENEB1312; MXFP4 and the K-quant types follow it
-through per-type kernel traits. On by default on gfx906, carried by the extra
-buffer types like upstream's CPU weight repack, so `--no-repack` disables it
+path was contributed by DENEB1312; MXFP4, the K-quant types and the legacy
+Q5_1 follow it through per-type kernel traits. On by default on gfx906,
+carried by the extra buffer types like upstream's CPU weight repack, so
+`--no-repack` disables it
 (`-nr 1` in llama-bench); a draft model always loads canonical weights. Model
 load stages canonical bytes and repacks on the device, so `-sm layer` loads
 at vanilla-loader parity and tensor-parallel loads within about 1.4x of it.
@@ -275,6 +304,9 @@ lane slice repacks. VRAM use stays at the canonical size for every type.
 The K-quant rows are Qwen3-14B on MI50, pp512, tg128, one card in layer
 mode and two cards with `-sm tensor -tps 2`; Q4_K and Q5_K carry the affine
 scale and min pair and fold the activation sum through the q8_1 block sums.
+The Q5_1 row is a Qwen3.6-27B requantized to Q5_1, as no released Q5_1 build
+of it exists; on a Qwen3.8-Flash-Next MoE carrying 43 Q5_1 tensors the same
+repack is +11% prefill on four cards with `-sm tensor`.
 Greedy generation can differ from the canonical kernels within
 floating-point reassociation on every type.
 

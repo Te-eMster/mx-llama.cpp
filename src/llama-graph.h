@@ -274,6 +274,17 @@ public:
     ggml_tensor * s_copy_main;   // I32 [n_seqs]
     ggml_tensor * s_copy_extra;  // I32 [n_rs - n_seqs]
 
+    // Ring-mode physical destination rows, ordered j + n_seqs*s.
+    // Per-snapshot leaves are first-class inputs because views do not inherit the scheduler's staged-input contract.
+    ggml_tensor * s_write = nullptr; // I32 [n_seqs * n_snap]
+    // The same destinations in sequence-major, oldest-first order for batched convolution writes.
+    ggml_tensor * s_write_conv = nullptr; // I32 [n_seqs * n_snap]
+    std::vector<ggml_tensor *> s_write_slices;
+
+    void fill_s_write(const llama_ubatch * ubatch, const llama_memory_recurrent_context * m);
+    void upload_s_copy(const llama_memory_recurrent_context * m, int64_t n_seqs_ub);
+    int64_t n_snap = 0;
+
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse

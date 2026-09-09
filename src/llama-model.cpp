@@ -25,6 +25,8 @@
 #include "ggml.h"
 #include "ggml-cpp.h"
 
+#include <thread>
+#include <atomic>
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
@@ -378,6 +380,46 @@ static bool llama_ple_shard_enabled() {
         return on;
     }();
     return enabled;
+}
+
+// PLE gather table prefault, opt in with LLAMA_PLE_PREFAULT=1.
+// The lazily mapped table is paged in one row at a time by the first requests of a fresh process, and the rows a prompt touches are hash-selected, so there is nothing to predict:
+// touch every page once at load from a few threads and join, so the first request runs on a warm table.
+// Costs load time and page cache, which the kernel may reclaim under pressure.
+// file-backed pages count in RSS while mapped.
+// No VRAM.
+static void llama_ple_prefault(const ggml_tensor * tab) {
+    static const bool enabled = [] {
+        const char * s = getenv("LLAMA_PLE_PREFAULT");
+        return s != nullptr && atoi(s) != 0;
+    }();
+    if (!enabled || tab == nullptr || tab->data == nullptr || tab->buffer == nullptr ||
+            !ggml_backend_buffer_is_host(tab->buffer)) {
+        return;
+    }
+    const size_t nbytes = ggml_nbytes(tab);
+    const size_t page   = 4096;
+    const int n_threads = 8;
+    const int64_t t0 = ggml_time_us();
+    std::vector<std::thread> workers;
+    std::atomic<uint64_t> sink{0};
+    for (int t = 0; t < n_threads; ++t) {
+        workers.emplace_back([&, t]() {
+            const size_t lo = (nbytes * t) / n_threads;
+            const size_t hi = (nbytes * (t + 1)) / n_threads;
+            const volatile uint8_t * p = (const volatile uint8_t *) tab->data;
+            uint64_t acc = 0;
+            for (size_t off = lo; off < hi; off += page) {
+                acc += p[off];
+            }
+            sink += acc;
+        });
+    }
+    for (auto & w : workers) {
+        w.join();
+    }
+    LLAMA_LOG_WARN("%s: LLAMA_PLE_PREFAULT=1, touched %zu MiB of %s in %.1f s (%d threads)\n", __func__,
+                   nbytes / (1024 * 1024), tab->name, (ggml_time_us() - t0) / 1e6, n_threads);
 }
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
@@ -2212,6 +2254,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
     }
+
+    llama_ple_prefault(per_layer_tok_embd);
 
     return true;
 }

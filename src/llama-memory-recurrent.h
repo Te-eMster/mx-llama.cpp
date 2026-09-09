@@ -73,8 +73,33 @@ public:
     // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
     uint32_t n_rs_seq = 0;
 
+    // Only the delta-net implementations converted to row-scattered snapshot writes use the ring.
+    // Other recurrent architectures retain the existing plane-indexed layout.
+    bool ring_enabled = false;
+
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;
+
+    // Absolute position each pending rollback rewinds to.
+    std::vector<llama_pos> rs_target;
+
+    // In ring mode, logical snapshot s lives at physical plane (plane_head + s) % n_planes().
+    // valid_depth bounds how far a sequence can rewind.
+    std::vector<uint32_t> plane_head;
+    std::vector<uint32_t> valid_depth;
+
+    // A graph input advances ring metadata before graph execution.
+    // A failed execution may have overwritten any destination plane, so affected sequences are invalidated rather than exposing a partially written snapshot by restoring metadata alone.
+    std::vector<bool> ring_valid;
+    std::vector<bool> pass_touched;
+    bool pass_staged = false;
+
+    uint32_t n_planes() const { return n_rs_seq + 1; }
+
+    void reset_ring(llama_seq_id seq_id);
+    void stage_rs_seq(llama_seq_id seq_id);
+    void finish_rs_pass(bool success);
+    void advance_planes(llama_seq_id seq_id, uint32_t n_new);
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
@@ -158,6 +183,7 @@ public:
 
     bool next()  override;
     bool apply() override;
+    void finish_compute(bool success) override;
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
@@ -170,12 +196,18 @@ public:
     uint32_t get_head() const;
     int32_t  get_rs_z() const;
     uint32_t get_size() const;
+    uint32_t get_n_planes() const;
+    bool     uses_ring() const;
 
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;
     ggml_tensor * get_p_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
+
+    // Fill dst with physical rows ordered j + n_seqs*s, then advance each sequence ring.
+    // Must run after s_copy() has consumed a pending rollback.
+    void plan_snapshot_writes(int32_t * dst, uint32_t n_seqs, uint32_t n_snap) const;
 
 private:
     const llama_memory_status status;

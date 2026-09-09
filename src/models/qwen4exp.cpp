@@ -1067,7 +1067,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     const int64_t conv_channels    = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
 
     ggml_tensor * conv_input = build_conv_state_at(inp, conv_states_all, qkv_mixed,
-            conv_kernel_size - 1, conv_channels, il);
+            conv_kernel_size - 1, conv_channels, il, /* keep_snapshots = */ true);
 
     ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
@@ -1289,7 +1289,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
         ggml_tensor *        x,
         int64_t              state_cols,
         int64_t              channels,
-        int                  il) {
+        int                  il,
+        bool                 keep_snapshots) {
     const auto * mctx_cur = inp->mctx;
 
     const auto kv_head = mctx_cur->get_head();
@@ -1311,28 +1312,90 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
 
     ggml_tensor * conv_input = ggml_concat(ctx0, state, ggml_transpose(ctx0, x), 0);
 
-    // [TAG_RECURRENT_ROLLBACK_SPLITS] keep the last state_cols columns once per rollback slot,
-    // slot s ending s tokens earlier so a rollback of s tokens reads a history that never saw them
     const size_t row_size = ggml_row_size(conv_states_all->type, row_total);
-    const uint32_t mem_size = mctx_cur->get_size();
+    const int64_t n_new_cols = conv_input->ne[0] - state_cols;
 
-    const int64_t n_slots = (int64_t) cparams.n_rs_seq + 1;
+    if (keep_snapshots && inp->s_write_conv != nullptr) {
+        GGML_ASSERT(inp->n_snap > 0 && inp->n_snap <= n_new_cols);
 
-    for (int64_t slot = 0; slot < n_slots; ++slot) {
-        const int64_t s_idx = std::max<int64_t>(0, conv_input->ne[0] - state_cols - slot);
+        // One strided window per snapshot, each made contiguous on its own.
+        // An im2col over the widened tail needs a flat view that cuts inside a head-split segment under -sm tensor, and the meta backend has no split rule for im2col anyway.
+        const int64_t first_col = n_new_cols - inp->n_snap + 1;
+        ggml_tensor * windows = nullptr;
+        for (int64_t snap = 0; snap < inp->n_snap; ++snap) {
+            ggml_tensor * window = ggml_view_3d(ctx0, conv_input,
+                    state_cols, channels, n_seqs,
+                    conv_input->nb[1], conv_input->nb[2],
+                    ggml_row_size(conv_input->type, first_col + snap));
+            window  = ggml_reshape_3d(ctx0, ggml_cont(ctx0, window), row_total, 1, n_seqs);
+            windows = windows == nullptr ? window : ggml_concat(ctx0, windows, window, 1);
+        }
+        GGML_ASSERT(windows->ne[0] == row_total);
+        GGML_ASSERT(windows->ne[1] == inp->n_snap);
+        GGML_ASSERT(windows->ne[2] == n_seqs);
 
-        ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
-                state_cols, channels, n_seqs,
-                conv_input->nb[1], conv_input->nb[2],
-                ggml_row_size(conv_input->type, s_idx));
+        ggml_tensor * flat = ggml_reshape_2d(
+                ctx0, windows, row_total, n_seqs * inp->n_snap);
 
-        ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
-                state_cols * channels, n_seqs,
-                conv_states_all->nb[1],
-                (slot * mem_size + kv_head) * row_size);
-
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+        GGML_ASSERT(inp->s_write_conv->ne[0] == n_seqs * inp->n_snap);
+        ggml_build_forward_expand(gf,
+                ggml_set_rows(ctx0, conv_states_all, flat, inp->s_write_conv));
+        return conv_input;
     }
+
+    // Parallel contexts deliberately retain the plane-indexed implementation until ring histories can be migrated when seq_cp() descendants diverge into different cells.
+    // Preserve all bounded-rollback snapshots here:
+    // newest windows come from this ubatch and the older survivors are staged before the destination planes are overwritten.
+    if (keep_snapshots && cparams.n_rs_seq > 0) {
+        const int64_t  K            = (int64_t) cparams.n_rs_seq + 1;
+        const uint32_t mem_size     = mctx_cur->get_size();
+        const int64_t  n_from_input = std::max<int64_t>(1, std::min<int64_t>(K, n_new_cols));
+        const int64_t  n_keep       = K - n_from_input;
+
+        ggml_tensor * shifted = nullptr;
+        if (n_keep > 0) {
+            ggml_tensor * old_planes = ggml_view_3d(ctx0, conv_states_all,
+                    row_total, n_seqs, n_keep,
+                    conv_states_all->nb[1],
+                    (size_t) mem_size * row_size,
+                    (size_t) kv_head * row_size);
+            shifted = ggml_cont(ctx0, old_planes);
+            ggml_build_forward_expand(gf, shifted);
+        }
+
+        for (int64_t snap = 0; snap < n_from_input; ++snap) {
+            ggml_tensor * window = ggml_view_3d(ctx0, conv_input,
+                    state_cols, channels, n_seqs,
+                    conv_input->nb[1], conv_input->nb[2],
+                    ggml_row_size(conv_input->type, n_new_cols - snap));
+            ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
+                    row_total, n_seqs, conv_states_all->nb[1],
+                    ((size_t) snap * mem_size + kv_head) * row_size);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, window), dst));
+        }
+
+        if (shifted != nullptr) {
+            ggml_tensor * dst = ggml_view_3d(ctx0, conv_states_all,
+                    row_total, n_seqs, n_keep,
+                    conv_states_all->nb[1],
+                    (size_t) mem_size * row_size,
+                    (size_t) (kv_head + (uint32_t) n_from_input * mem_size) * row_size);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, shifted, dst));
+        }
+
+        return conv_input;
+    }
+
+    ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
+            state_cols, channels, n_seqs,
+            conv_input->nb[1], conv_input->nb[2],
+            ggml_row_size(conv_input->type, n_new_cols));
+
+    ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
+            row_total, n_seqs, conv_states_all->nb[1],
+            kv_head * row_size);
+
+    ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
 
     return conv_input;
 }
@@ -1416,7 +1479,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
     // [hist + n_seq_tokens, hc_dim, n_seqs], tokens on ne[0]
     ggml_tensor * padded = build_conv_state_at(inp, inp->mctx->get_p_l(il),
             ggml_reshape_3d(ctx0, normalized, hc_dim, n_seq_tokens, n_seqs),
-            hist, hc_dim, il);
+            hist, hc_dim, il, /* keep_snapshots = */ true);
 
     ggml_tensor * conv_out = nullptr;
     for (int64_t k = 0; k < kern; ++k) {

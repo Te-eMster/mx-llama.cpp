@@ -33,7 +33,28 @@ llama_memory_recurrent::llama_memory_recurrent(
     used = 0;
 
     this->n_rs_seq = n_rs_seq;
+
+    switch (model.arch) {
+        case LLM_ARCH_QWEN3NEXT:
+        case LLM_ARCH_QWEN35:
+        case LLM_ARCH_QWEN35MOE:
+        case LLM_ARCH_QWEN4EXP:
+            // A forked sequence can later diverge into a different physical cell.
+            // Preserving all of its historical ring planes across that move needs a multi-sequence copy planner.
+            // until that exists, keep the proven plane-indexed path for parallel contexts instead of advertising history which remains in the source cell.
+            ring_enabled = n_rs_seq > 0 && n_seq_max == 1;
+            break;
+        default:
+            ring_enabled = false;
+            break;
+    }
+
     rs_idx.assign(n_seq_max, 0);
+    rs_target.assign(n_seq_max, -1);
+    plane_head.assign(n_seq_max, 0);
+    valid_depth.assign(n_seq_max, 1);
+    ring_valid.assign(n_seq_max, true);
+    pass_touched.assign(n_seq_max, false);
 
     cells.clear();
     cells.resize(mem_size);
@@ -125,6 +146,10 @@ llama_memory_recurrent::llama_memory_recurrent(
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
+    if (ring_enabled && !ctxs_bufs.empty()) {
+        LLAMA_LOG_INFO("%s: snapshot ring enabled, planes = %u\n", __func__, n_planes());
+    }
+
     {
         const size_t memory_size_r = size_r_bytes();
         const size_t memory_size_s = size_s_bytes();
@@ -139,6 +164,8 @@ llama_memory_recurrent::llama_memory_recurrent(
 }
 
 void llama_memory_recurrent::clear(bool data) {
+    reset_ring(-1);
+
     for (int32_t i = 0; i < (int32_t) size; ++i) {
         cells[i].pos = -1;
         cells[i].seq_id.clear();
@@ -154,8 +181,6 @@ void llama_memory_recurrent::clear(bool data) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
     }
-
-    std::fill(rs_idx.begin(), rs_idx.end(), 0);
 }
 
 bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -176,7 +201,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
 
     const bool rm_all = p0 == 0 && p1 == std::numeric_limits<llama_pos>::max();
     if (rm_all) {
-        set_rs_idx(seq_id, 0);
+        reset_ring(seq_id);
     }
 
     // models like Mamba or RWKV can't have a state partially erased at the end
@@ -192,15 +217,47 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
 
             // partial rollback via per-token snapshot index (bounded by n_rs_seq)
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
-                const llama_pos rollback = cell.pos - (p0 - 1);
-                // pending rollback is single-use
-                const bool pending = rs_idx[seq_id] != 0;
-                if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
-                    set_rs_idx(seq_id, (uint32_t) rollback);
-                    cell.pos = p0 - 1;
-                    return true;
+                const bool invalid_ring = ring_enabled && !ring_valid[seq_id];
+
+                // A failed ring transaction deliberately invalidates this sequence.
+                // Fall through to the ordinary range removal so decode cleanup can discard the failed ubatch, but never arm a rollback against potentially partial rows.
+                if (!invalid_ring) {
+                    bool has_state = false;
+                    for (auto * s : s_l) {
+                        if (s != nullptr) {
+                            has_state = true;
+                            break;
+                        }
+                    }
+                    if (!has_state) {
+                        cell.pos = p0 - 1;
+                        return true;
+                    }
+
+                    const llama_pos rollback = cell.pos - (p0 - 1);
+                    const llama_pos target   = p0 - 1;
+                    const bool pending       = rs_idx[seq_id] != 0;
+                    const bool duplicate     = pending && rs_target[seq_id] == target;
+
+                    if (duplicate) {
+                        return true;
+                    }
+
+                    const llama_pos max_rollback = ring_enabled
+                        ? std::min<llama_pos>((llama_pos) n_rs_seq, (llama_pos) valid_depth[seq_id] - 1)
+                        : (llama_pos) n_rs_seq;
+                    if (!pending && rollback >= 1 && rollback <= max_rollback) {
+                        set_rs_idx(seq_id, (uint32_t) rollback);
+                        rs_target[seq_id] = target;
+                        cell.pos = target;
+                        return true;
+                    }
+
+                    LLAMA_LOG_WARN("%s: refusing rollback seq %d: pending=%d (rs_idx=%u target=%d) "
+                            "rollback=%d limit=%d\n", __func__, seq_id, (int) pending,
+                            rs_idx[seq_id], (int) rs_target[seq_id], (int) rollback, (int) max_rollback);
+                    return false;
                 }
-                return false;
             }
             // invalidate tails which will be cleared
             if (p0 <= cell.pos && cell.pos < p1) {
@@ -285,6 +342,12 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
 
 void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
     uint32_t new_head = size;
+
+    for (size_t i = 0; i < ring_valid.size(); ++i) {
+        if ((llama_seq_id) i != seq_id) {
+            reset_ring((llama_seq_id) i);
+        }
+    }
 
     for (uint32_t i = 0; i < size; ++i) {
         if ((llama_seq_id) i != seq_id) {
@@ -406,6 +469,7 @@ llama_pos llama_memory_recurrent::seq_pos_max(llama_seq_id seq_id) const {
 void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
     if (seq_id < 0) {
         std::fill(rs_idx.begin(), rs_idx.end(), 0);
+        std::fill(rs_target.begin(), rs_target.end(), (llama_pos) -1);
         return;
     }
 
@@ -415,6 +479,108 @@ void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
     GGML_ASSERT(idx <= n_rs_seq);
 
     rs_idx[seq_id] = idx;
+
+    if (idx == 0) {
+        rs_target[seq_id] = -1;
+    }
+}
+
+void llama_memory_recurrent::reset_ring(llama_seq_id seq_id) {
+    auto reset_one = [&](size_t i) {
+        plane_head[i]  = 0;
+        valid_depth[i] = 1;
+        ring_valid[i]  = true;
+        rs_idx[i]      = 0;
+        rs_target[i]   = -1;
+        pass_touched[i] = false;
+    };
+
+    if (seq_id < 0) {
+        for (size_t i = 0; i < rs_idx.size(); ++i) {
+            reset_one(i);
+        }
+        pass_staged = false;
+        return;
+    }
+
+    GGML_ASSERT((size_t) seq_id < rs_idx.size());
+    reset_one((size_t) seq_id);
+    pass_staged = std::any_of(pass_touched.begin(), pass_touched.end(), [](bool touched) { return touched; });
+}
+
+void llama_memory_recurrent::stage_rs_seq(llama_seq_id seq_id) {
+    if (!ring_enabled || seq_id < 0) {
+        return;
+    }
+
+    GGML_ASSERT((size_t) seq_id < ring_valid.size());
+    GGML_ASSERT(ring_valid[seq_id] && "using an invalid recurrent snapshot ring");
+
+    if (!pass_staged) {
+        std::fill(pass_touched.begin(), pass_touched.end(), false);
+        pass_staged = true;
+    }
+    pass_touched[seq_id] = true;
+}
+
+void llama_memory_recurrent::finish_rs_pass(bool success) {
+    if (!pass_staged) {
+        return;
+    }
+
+    if (!success) {
+        size_t n_invalid = 0;
+        for (size_t i = 0; i < pass_touched.size(); ++i) {
+            if (!pass_touched[i]) {
+                continue;
+            }
+            ring_valid[i]  = false;
+            valid_depth[i] = 0;
+            rs_idx[i]      = 0;
+            rs_target[i]   = -1;
+            ++n_invalid;
+        }
+        LLAMA_LOG_ERROR("%s: graph compute failed; invalidated %zu recurrent snapshot ring sequence(s)\n",
+                __func__, n_invalid);
+    }
+
+    std::fill(pass_touched.begin(), pass_touched.end(), false);
+    pass_staged = false;
+}
+
+void llama_memory_recurrent::advance_planes(llama_seq_id seq_id, uint32_t n_new) {
+    if (!ring_enabled || seq_id < 0 || (size_t) seq_id >= plane_head.size() || n_new == 0) {
+        return;
+    }
+
+    stage_rs_seq(seq_id);
+
+    const uint32_t n_ring = n_planes();
+    n_new = std::min(n_new, n_ring);
+    plane_head[seq_id] = (plane_head[seq_id] + n_ring - n_new % n_ring) % n_ring;
+    valid_depth[seq_id] = std::min(n_ring, valid_depth[seq_id] + n_new);
+}
+
+void llama_memory_recurrent_context::plan_snapshot_writes(
+        int32_t * dst, uint32_t n_seqs, uint32_t n_snap) const {
+    GGML_ASSERT(mem->ring_enabled);
+    GGML_ASSERT(dst != nullptr);
+    GGML_ASSERT(n_snap > 0 && n_snap <= mem->n_planes());
+    GGML_ASSERT(mem->head + n_seqs <= mem->cells.size());
+
+    for (uint32_t j = 0; j < n_seqs; ++j) {
+        const uint32_t cell_idx = mem->head + j;
+        GGML_ASSERT(!mem->cells[cell_idx].seq_id.empty());
+        const llama_seq_id seq = *mem->cells[cell_idx].seq_id.begin();
+        GGML_ASSERT(seq >= 0 && (size_t) seq < mem->plane_head.size());
+
+        mem->advance_planes(seq, n_snap);
+        const uint32_t head = mem->plane_head[seq];
+        for (uint32_t snap = 0; snap < n_snap; ++snap) {
+            const uint32_t plane = (head + snap) % mem->n_planes();
+            dst[j + n_seqs * snap] = (int32_t) (plane * mem->size + cell_idx);
+        }
+    }
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
@@ -505,6 +671,20 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
 bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     const uint32_t n_seq_tokens = ubatch.n_seq_tokens;
     const uint32_t n_seqs       = ubatch.n_seqs;
+
+    if (ring_enabled) {
+        for (uint32_t s = 0; s < n_seqs; ++s) {
+            const uint32_t i = s * n_seq_tokens;
+            for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+                const llama_seq_id seq_id = ubatch.seq_id[i][j];
+                if (seq_id >= 0 && (size_t) seq_id < ring_valid.size() && !ring_valid[seq_id]) {
+                    LLAMA_LOG_ERROR("%s: recurrent snapshot ring for seq %d was invalidated by a failed "
+                            "compute; clear or restore the sequence before decoding again\n", __func__, seq_id);
+                    return false;
+                }
+            }
+        }
+    }
 
     // if we have enough unused cells before the current head ->
     //   better to start searching from the beginning of the cache, hoping to fill it
@@ -778,29 +958,35 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
         // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]
         if ((seq_id == -1 && !cell.is_empty()) || cell.has_seq_id(seq_id)) {
             ++cell_count;
-            uint32_t rs_idx_cur = 0;
+            uint32_t plane_cur = 0;
 
             if (n_rs_seq != 0) {
-                if (seq_id != -1) {
-                    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < rs_idx.size());
-                    rs_idx_cur = rs_idx[seq_id];
-                } else {
-                    bool has_rs_idx = false;
-                    for (const llama_seq_id cell_seq_id : cell.seq_id) {
-                        GGML_ASSERT(cell_seq_id >= 0 && (size_t) cell_seq_id < rs_idx.size());
+                auto plane_for = [&](llama_seq_id sid) -> uint32_t {
+                    GGML_ASSERT(sid >= 0 && (size_t) sid < rs_idx.size());
+                    if (!ring_enabled) {
+                        return rs_idx[sid];
+                    }
+                    GGML_ASSERT(ring_valid[sid]);
+                    return (plane_head[sid] + rs_idx[sid]) % n_planes();
+                };
 
-                        const uint32_t seq_rs_idx = rs_idx[cell_seq_id];
-                        if (!has_rs_idx) {
-                            rs_idx_cur = seq_rs_idx;
-                            has_rs_idx = true;
-                        } else if (rs_idx_cur != seq_rs_idx) {
-                            GGML_ABORT("cannot write shared recurrent state with different rollback indices");
+                if (seq_id != -1) {
+                    plane_cur = plane_for(seq_id);
+                } else {
+                    bool has_plane = false;
+                    for (const llama_seq_id cell_seq_id : cell.seq_id) {
+                        const uint32_t seq_plane = plane_for(cell_seq_id);
+                        if (!has_plane) {
+                            plane_cur = seq_plane;
+                            has_plane = true;
+                        } else if (plane_cur != seq_plane) {
+                            GGML_ABORT("cannot write shared recurrent state resolving to different snapshot planes");
                         }
                     }
                 }
             }
 
-            const uint32_t cell_id = rs_idx_cur * size + (cell.src >= 0 ? cell.src : (int32_t) i);
+            const uint32_t cell_id = plane_cur * size + (cell.src >= 0 ? cell.src : (int32_t) i);
             if (cell_ranges_data.empty() || cell_ranges_data.back().second != cell_id) {
                 cell_ranges_data.emplace_back(cell_id, cell_id + 1);
             } else {
@@ -854,6 +1040,9 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
 
     res = res && state_read_meta(io, cell_count, seq_id);
 
+    // A serialized recurrent state contains one logical row, restored into plane 0.
+    reset_ring(seq_id);
+
     try {
         res = res && state_read_data(io, cell_count);
     } catch (...) {
@@ -870,9 +1059,6 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
         throw std::runtime_error("failed to restore kv cache");
     }
 
-    if (n_rs_seq != 0) {
-        set_rs_idx(seq_id, 0);
-    }
 }
 
 void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id) const {
@@ -1260,9 +1446,13 @@ bool llama_memory_recurrent_context::apply() {
         return true;
     }
 
-    mem->find_slot(ubatches[i_next]);
+    return mem->find_slot(ubatches[i_next]);
+}
 
-    return true;
+void llama_memory_recurrent_context::finish_compute(bool success) {
+    if (mem != nullptr) {
+        mem->finish_rs_pass(success);
+    }
 }
 
 llama_memory_status llama_memory_recurrent_context::get_status() const {
@@ -1291,6 +1481,14 @@ uint32_t llama_memory_recurrent_context::get_size() const {
     return mem->size;
 }
 
+uint32_t llama_memory_recurrent_context::get_n_planes() const {
+    return mem->n_planes();
+}
+
+bool llama_memory_recurrent_context::uses_ring() const {
+    return mem->ring_enabled;
+}
+
 ggml_tensor * llama_memory_recurrent_context::get_r_l(int32_t il) const {
     return mem->r_l[il];
 }
@@ -1311,14 +1509,23 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
         return src0;
     }
 
-    uint32_t idx = 0;
+    uint32_t plane = 0;
     if (!mem->cells[cell_idx].seq_id.empty()) {
         const llama_seq_id seq = *mem->cells[cell_idx].seq_id.begin();
         if (seq >= 0 && (size_t) seq < mem->rs_idx.size()) {
-            idx = mem->rs_idx[seq];
-            // reset rollback idx
-            mem->rs_idx[seq] = 0;
+            const uint32_t idx = mem->rs_idx[seq];
+            if (mem->ring_enabled) {
+                GGML_ASSERT(mem->ring_valid[seq]);
+                mem->stage_rs_seq(seq);
+                plane = (mem->plane_head[seq] + idx) % mem->n_planes();
+                mem->plane_head[seq] = plane;
+                mem->valid_depth[seq] = mem->valid_depth[seq] > idx
+                    ? mem->valid_depth[seq] - idx : 1;
+            } else {
+                plane = idx;
+            }
+            mem->set_rs_idx(seq, 0);
         }
     }
-    return (int32_t)(idx * mem->size) + src0;
+    return (int32_t) (plane * mem->size) + src0;
 }
