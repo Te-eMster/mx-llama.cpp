@@ -89,6 +89,24 @@ KV staging, a KV-only prefill replay, disabling the draft context's pipeline rin
 and a non-finite-draft fail-safe. Default off uses the standard `draft-mtp` path
 with these disabled. Backend-generic.
 
+## Recurrent state rollback (snapshot ring)
+
+Recurrent and hybrid models checkpointed their state by whole planes, so a rejected
+speculative draft had no cheap way back and the state was rebuilt rather than rewound.
+That is what made MTP drafting on a delta-net model cost more than it saved. Each
+sequence now keeps its snapshots in a ring of physical planes with a head and a valid
+depth, the delta-net kernels scatter per-token snapshot rows as they run, and a graph
+that fails invalidates the affected sequences instead of leaving a half-written plane
+visible. Measured on 4x MI50 with Qwen3.8-Flash-Next MTP UD-Q4_K_XL, 554-token prompt
+at draft depth 2: speculative generation 29.8 to 42.4 t/s on `-sm layer` and 16.4 to
+42.5 t/s on `-sm tensor`, where before the change speculating was slower than not
+speculating at all. Plain generation goes 30.3 to 31.4 t/s with byte-identical output,
+and Qwen3.6-35B-A3B-Q4_K_M single-GPU prefill is unchanged, 955 to 953 (guardrail). No
+flag: rollback engages when a caller asks for it with a single sequence, and it is
+clamped off above one sequence and below a minimum micro-batch with a warning. It lives
+in the recurrent memory layer, so every delta-net model shares it. Backend-generic, the
+delta-net kernels are validated on gfx906.
+
 ## Concurrent lane dispatch
 
 Under `-sm tensor` the meta backend issued each subgraph to its GPUs in device
@@ -152,12 +170,22 @@ the loader maps lazily-read tensors even under `-lm dio`: the mapping is virtual
 prefetch is zero and the range is never populated, which avoids whole-model mmap's
 page thrashing while still letting the table be demand paged.
 
+The table can instead be warmed at load: `LLAMA_PLE_PREFAULT=1` touches one byte per
+page of it from eight threads once the weights are in, so the first request does not
+fault the rows in one at a time. That moves the read out of the first request and into
+load time, so how much it is worth is bounded by storage throughput, and it buys
+nothing once the table is already in page cache - it pays on a fresh process, not on a
+warm one. The log line reports the size touched and how long it took, so the cost is
+visible per machine. Off by default, inert when the table is not host resident, and it
+uses no VRAM.
+
 A NextN/MTP draft head is supported with `--spec-type draft-mtp`, converted by
 `convert_hf_to_gguf.py --mtp`. Draft acceptance runs 75-90 percent at `n_max 2` and
-is strongly text dependent (46 to 90 percent across prompts). Whether it is a net
-throughput win depends on the split mode - under `-sm tensor` the multi-GPU verify
-costs more than the drafting saves, while `-sm layer` lands near parity - so measure
-on your own topology before enabling it.
+is strongly text dependent (46 to 90 percent across prompts). With the recurrent
+snapshot ring above it is a throughput win in both split modes on this quant - see
+that section for the numbers - where previously the multi-GPU verify under `-sm tensor`
+cost more than the drafting saved. Acceptance still tracks the text, so measure on your
+own prompts.
 
 ## Shared-expert tensor-parallel split
 
