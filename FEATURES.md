@@ -276,14 +276,15 @@ The quantized copy is now kept and handed to the later matmuls, which is
 bit-exact. Worth +2.2-2.6% on prefill and decode. On by default;
 `GGML_CUDA_Q8_1_CACHE=0` restores the old behavior. Backend-generic.
 
-## Q8_0, MXFP4 and K-quant weight repack (gfx906)
+## Q8_0, MXFP4, K-quant and Q5_1 weight repack (gfx906)
 
 Weights of the types below upload into a repacked layout (quants and scales
 in separate planes, rows de-aliased) that the gfx906 MMQ and mat-vec kernels
 read directly, so prefill stops paying for per-block scale gathers. The Q8_0
-path was contributed by DENEB1312; MXFP4 and the K-quant types follow it
-through per-type kernel traits. On by default on gfx906, carried by the extra
-buffer types like upstream's CPU weight repack, so `--no-repack` disables it
+path was contributed by DENEB1312; MXFP4, the K-quant types and the legacy
+Q5_1 follow it through per-type kernel traits. On by default on gfx906,
+carried by the extra buffer types like upstream's CPU weight repack, so
+`--no-repack` disables it
 (`-nr 1` in llama-bench); a draft model always loads canonical weights. Model
 load stages canonical bytes and repacks on the device, so `-sm layer` loads
 at vanilla-loader parity and tensor-parallel loads within about 1.4x of it.
@@ -303,6 +304,9 @@ lane slice repacks. VRAM use stays at the canonical size for every type.
 The K-quant rows are Qwen3-14B on MI50, pp512, tg128, one card in layer
 mode and two cards with `-sm tensor -tps 2`; Q4_K and Q5_K carry the affine
 scale and min pair and fold the activation sum through the q8_1 block sums.
+The Q5_1 row is a Qwen3.6-27B requantized to Q5_1, as no released Q5_1 build
+of it exists; on a Qwen3.8-Flash-Next MoE carrying 43 Q5_1 tensors the same
+repack is +11% prefill on four cards with `-sm tensor`.
 Greedy generation can differ from the canonical kernels within
 floating-point reassociation on every type.
 
