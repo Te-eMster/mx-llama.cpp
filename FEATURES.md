@@ -29,7 +29,6 @@ cmake --build build --config Release -j
 Recommended environment (each variable enables one of the features above):
 
 ```bash
-export GGML_ENABLE_CUSTOM_AR=1      # custom multi-GPU AllReduce
 export HSA_FORCE_FINE_GRAIN_PCIE=1  # peer-write AllReduce fast path (AMD over PCIe, validated gfx906)
 export GPU_MAX_HW_QUEUES=8          # MoE throughput on -tps
 export LLAMA_ENABLE_MTP_OPT=1       # MTP optimizations (with --spec-type draft-mtp)
@@ -73,7 +72,7 @@ requires `n_gpus % T == 0`. Backend-generic.
 An optional peer-write broadcast plus two-shot reduce-scatter / allgather
 AllReduce for the tensor-parallel reduction (in addition to upstream's
 `allreduce.cu`). F32 on the wire and faster than the RCCL / NCCL ring for token
-generation over PCIe. Enable with `GGML_ENABLE_CUSTOM_AR=1`; the fast peer-write
+generation over PCIe. On by default, `GGML_ENABLE_CUSTOM_AR=0` turns it off; the fast peer-write
 path needs fine-grain PCIe coherence (`HSA_FORCE_FINE_GRAIN_PCIE=1` on any AMD
 over PCIe, a no-op on hardware-coherent GPUs and ignored on NVIDIA). Decode-size
 collectives automatically use two-shot for TP5, TP8, TP10, and TP4 pipeline
@@ -152,6 +151,34 @@ sounds on long prompts: 8x MI50 `-sm layer` with a 23k prompt, 182 to 759 t/s, a
 `-tps 4` generation 23.9 to 26.8 t/s. Three identical requests return identical
 output and identical draft acceptance.
 
+## DeepSeek-V4.1-Flash architecture support
+
+V4.1 keeps V4's grouped-LoRA output projection and single-head KV latent, and changes three things the V4 path cannot express.
+Its compressed tiers are declared per layer in model metadata rather than keyed off V4's fixed compression ratio of 4, so the pooled compressor serves both of V4.1's tiers instead of only the plain one.
+The hyper-connection mix is shifted by one sublayer, so the mix a sublayer computes is consumed by the next one and the run starts from a one-hot mix that selects copy 0.
+V4.1 ships no `output_hc_*` head tensors and reuses the mix the last stage computed, so their absence selects the fold rather than failing the load.
+The per-head query norm V4 applies is absent in V4.1 and is dropped.
+
+Engram is an n-gram hash memory written into the hyper-connection residual at two layers.
+Each position hashes the 2-, 3- and 4-gram ending on it, once per head, giving row indices into that layer's table, and the rows become one key per hyper-connection copy plus a shared value added through a gate that measures how well the key matches the stream.
+The hash runs host side because it is int64 multiply, xor and modulo over the token history, none of which ggml has.
+The two tables are 48.6 GiB each and only a few rows are read per token, so they are mapped and read on demand rather than loaded as weights: put them on the fastest storage available.
+
+Measured on ten MI50 with a 16965-token prompt at temperature 0, `-sm layer`, `-ngl 41` with an explicit `-ts` split.
+The same greedy completion came back on every boot, so the architecture is reproducible, but prompt processing is not stable enough to quote as a single number: the two tables are 97 GiB against 32 GiB of host page cache, so throughput depends on which rows happen to be resident.
+
+```
+prefill  106 to 254 t/s     decode  12.5 to 13.9 t/s
+```
+
+The Engram gather is the dominant prompt-processing cost and is not yet solved.
+A 16965-token prompt takes about 678 thousand major faults and 63 GB of reads on a cold cache, and a load-time prefault of the tables makes it worse rather than better, because a 97 GiB sequential scan evicts the working set that demand paging had already assembled.
+
+Three diagnostic env gates ship with the support, all default off and each logging once when engaged: `LLAMA_DSV41_NO_ENGRAM` drops the Engram contribution, `LLAMA_DSV41_NO_COMPRESS` drops the compressed tier, and `LLAMA_DSV41_QNORM` restores the V4 query norm.
+
+Scope: `-sm layer`, and `-sm tensor -tps 2` since the incremental stage transfer for persistent caches, which reproduces its own output and beats layer mode on decode.
+Speculative decoding against a V4.1 DSpark sidecar is not supported yet.
+
 ## Qwen3.8-Flash-Next tensor parallelism
 
 Qwen3.8-Flash-Next carries a PLE n-gram table - 27465 MiB on the UD-Q4_K_XL quant, larger at
@@ -186,6 +213,19 @@ snapshot ring above it is a throughput win in both split modes on this quant - s
 that section for the numbers - where previously the multi-GPU verify under `-sm tensor`
 cost more than the drafting saved. Acceptance still tracks the text, so measure on your
 own prompts.
+
+Speculating used to cost most of the prefill throughput on this architecture, because two
+graph shapes moved from chunk to chunk and the scheduler could not keep a plan across them.
+Changing the NextN mode altered the graph output requirements without invalidating the
+reservation, so the following graph ran on a plan sized for the previous mode, and the
+rollback convolution snapshot graph emitted one window per snapshot the batch happened to
+carry, so its node count tracked history length. The snapshot graph now emits one window
+per ring plane and crops back to the snapshots actually present, which holds the node count
+constant while producing the same rows. On 4x MI50 with the MTP UD-Q4_K_XL quant, a
+15.8k-token prompt under `-sm layer` goes 421 to 1047 t/s of prefill, against 1184 t/s for
+the same prompt without speculation - so drafting now costs about a tenth of prefill rather
+than two thirds. Generation and draft acceptance are unchanged and the output is
+byte-identical. On by default, with no flag.
 
 ## Shared-expert tensor-parallel split
 
@@ -253,6 +293,22 @@ byte-identical in every arm:
 
 Hardware-queue handling (`GPU_MAX_HW_QUEUES`) and an optional RCCL point-to-point
 stage-transfer path (`GGML_META_XFER_RCCL`) for the multi-stage pipeline.
+
+## Incremental stage transfer for persistent caches
+
+A multi-stage `-sm tensor` pipeline hands every mirrored tensor a later stage reads across the stage boundary.
+When the reader is a view of a persistent cache, the boundary tensor used to be the writer's set_rows output, which is the whole cache view, so each hop copied the full cache on every token, and each reading layer's own view of a shared cache added one more full copy.
+DeepSeek-V4.1 layers after a source layer read the source layer's caches, and on ten MI50 at `-tps 2` the stage 3 hop moved about 244 MB per token, which is where tensor decode lost to layer mode and why the prefill pipeline never filled.
+The meta backend now keeps a host copy of the small integer inputs it is handed (the KV cell indices) and transfers a set_rows boundary as the dense cell range those indices name, a row block of each lane's own cache, exact bytes.
+A pure view of a persistent cache is served by the cache's writer once instead of one full copy per reading layer.
+Sparse or unknown indices fall back to the full copy, and `GGML_META_XFER_ROWS=0` restores the previous transfers.
+Measured on ten MI50 with a 16965-token prompt at temperature 0, Engram off, `-sm tensor -tps 2`, with the greedy top-5 records bit-identical across three requests and two boots:
+
+```
+prefill  214 -> 601 t/s     decode  7.2 -> 21.5 t/s     (-sm layer on the same prompt: 600 to 650 and 14.1)
+```
+
+Only multi-stage tensor splits go through this path, layer mode and single-stage splits do not run it, and a model whose layers read only their own caches moves nothing new.
 
 ## gfx906 kernel tuning
 

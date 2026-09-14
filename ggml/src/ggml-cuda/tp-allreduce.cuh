@@ -57,11 +57,9 @@ using FlagType = uint32_t;
 // Signal buffer for inter-GPU synchronization.
 // Allocated in fine-grained/uncached device memory for cross-device visibility.
 // Two flag arrays (start/end) prevent ABA problems between consecutive barriers.
-// Every kernel variant (one-shot, broadcast, twoshot) uses only these two —
-// the twoshot kernel places all reader-visibility ordering on barrier_start
-// (post-scatter) and barrier_end (post-allgather); no third barrier needed
-// since the local-scatter-to-result stage reads only allgather_buf, which
-// peer stage-1 writes of the next AR do not touch (different region).
+// Every kernel variant (one-shot, broadcast, twoshot) uses only these two.
+// The twoshot kernel orders reader visibility on barrier_start after the scatter and on barrier_end after the allgather.
+// No third barrier follows its local copy out of allgather_buf, because that region sits in the upper half of the staging allocation where the scatter writes of the next call cannot reach it.
 struct Signal {
     alignas(128) FlagType start[kMaxBlocks][kMaxRanks];
     alignas(128) FlagType end[kMaxBlocks][kMaxRanks];
@@ -191,6 +189,8 @@ struct CustomARPlan {
     void *            zero_ptr[kMaxRanks] = {};
     size_t            zero_bytes = 0;
     int64_t           n_elements = 0;
+    // First float of the two-shot allgather region, half of the staging allocation.
+    int64_t           ag_offset  = 0;
     int               nranks     = 0;
     int               blocks     = 0;
     bool              twoshot    = false;

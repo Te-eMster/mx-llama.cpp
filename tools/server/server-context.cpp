@@ -17,7 +17,8 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
-//#include "../../src/llama-memory.h"
+#include "../../src/llama-memory.h"
+#include "../../src/llama-ext.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -3679,6 +3680,40 @@ private:
         }
     }
 
+    bool reserve_prompt_graph(const llama_batch & batch_view) {
+        static const bool enabled = []() {
+            const char * value = getenv("LLAMA_DSPARK_PROMPT_RESERVE");
+            return value == nullptr || atoi(value) != 0;
+        }();
+        if (!enabled || !spec || slots.size() != 1 || llama_n_seq_max(ctx_tgt) != 1 ||
+                params_base.split_mode != LLAMA_SPLIT_MODE_LAYER || llama_model_n_devices(model_tgt) < 2 ||
+                batch.has_embd || !batch_view.pos || batch_view.pos[0] != 0 ||
+                batch_view.n_tokens <= (int32_t) llama_n_ubatch(ctx_tgt) || !batch.tokens.front().is_prompt) {
+            return true;
+        }
+        const auto & types = params_base.speculative.types;
+        if (std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) == types.end() ||
+                std::any_of(types.begin(), types.end(), [](common_speculative_type type) { return type != COMMON_SPECULATIVE_TYPE_NONE && type != COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK; })) {
+            return true;
+        }
+        const auto & slot = slots.front();
+        if (!slot.task || slot.task->type != SERVER_TASK_TYPE_COMPLETION || slot.need_embd() ||
+                slot.task->tokens.has_mtmd || !slot.lora.empty() || !llama_get_memory(ctx_tgt)) {
+            return true;
+        }
+
+        const int64_t start_us = ggml_time_us();
+        const uint32_t n_tokens = std::min(llama_n_ctx(ctx_tgt), llama_n_ubatch(ctx_tgt));
+        const uint32_t n_outputs = std::min(n_tokens, (uint32_t) params_base.n_outputs_max);
+        SLT_INF(slot, "DSpark prompt reserve begin: tokens=%u, outputs=%u, explicit synchronize\n", n_tokens, n_outputs);
+        llama_synchronize(ctx_tgt);
+        llama_sched_reserve(ctx_tgt);
+        const bool ok = llama_graph_reserve(ctx_tgt, n_tokens, 1, n_outputs) != nullptr;
+        SLT_INF(slot, "DSpark prompt reserve end: ok=%d, %.3f ms including synchronization\n", ok,
+                (ggml_time_us() - start_us) / 1000.0);
+        return ok;
+    }
+
     // returns true = success ; false = retry with smaller batch size
     // throw std::runtime_error on fatal error
     bool decode(int32_t & n_batch, int32_t off, llama_batch & batch_view) {
@@ -3716,7 +3751,7 @@ private:
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
-            ret = llama_decode(ctx_tgt, batch_view);
+            ret = reserve_prompt_graph(batch_view) ? llama_decode(ctx_tgt, batch_view) : -2;
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }

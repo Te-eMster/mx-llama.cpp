@@ -446,12 +446,13 @@ k_broadcast_reduce(
 //                                            Slot r holds rank r's contribution
 //                                            to OUR slice (my_rank). Filled in
 //                                            stage 1 by peer writes.
-//   [n_elements * 4, 2 * n_elements * 4)   : allgather_buf — N F32 slots, same
-//                                            layout. Slot r holds rank r's
-//                                            reduced slice. Filled in stage 3
-//                                            by peer writes from rank r.
-// dp.ptrs[r] points to rank r's scatter_buf base; allgather_buf is at
-// +n_elements floats from that base.
+//   [ag_offset * 4, (ag_offset + n_elements) * 4) : allgather_buf, N F32 slots in the same layout.
+//                                            Slot r holds rank r's reduced slice, filled in stage 3 by peer writes from rank r.
+// dp.ptrs[r] points to rank r's scatter_buf base and allgather_buf starts ag_offset floats above it.
+// ag_offset is half of the staging allocation, not n_elements.
+// A rank leaves the kernel as soon as its own stage 4 copy is done, while a peer can still be copying out of its allgather_buf.
+// With the allgather region at n_elements, a larger next call scattered into [0, n_new) on top of the peer's live reads of [n_old, 2 * n_old) and that rank reduced garbage.
+// The upper half lies above every scatter region the allocation can hold, so no third barrier is needed.
 //
 // Per-rank peer traffic: stage 1 (N-1) * slice F32 + stage 3 (N-1) * slice
 // F32 = 2*(N-1)/N * S bytes outbound (S = n_elements * sizeof(float)).
@@ -468,7 +469,8 @@ k_twoshot_f32(
         const float * __restrict__ input,   // our own input (F32)
         float *    __restrict__  result,    // our own output (F32)
         int                      rank,
-        int64_t                  n_elements) {
+        int64_t                  n_elements,
+        int64_t                  ag_offset) {
 
     auto dp = *_dp;
 
@@ -478,9 +480,9 @@ k_twoshot_f32(
 
     // Staging pointers — each rank's staging holds scatter_buf then allgather_buf.
     // rank r's scatter_buf base   = dp.ptrs[r]              (float*)
-    // rank r's allgather_buf base = dp.ptrs[r] + n_elements (float* stride of n_elements floats)
+    // rank r's allgather_buf base = dp.ptrs[r] + ag_offset, the upper half of the staging allocation
     auto scat_ptr = [&](int r) -> float * { return (float *)(uintptr_t) dp.ptrs[r]; };
-    auto ag_ptr   = [&](int r) -> float * { return ((float *)(uintptr_t) dp.ptrs[r]) + n_elements; };
+    auto ag_ptr   = [&](int r) -> float * { return ((float *)(uintptr_t) dp.ptrs[r]) + ag_offset; };
 
     // ------------------------------------------------------------------------
     // Stage 1 (peer-write scatter): for each non-self target peer, all threads
@@ -947,6 +949,9 @@ bool tp_custom_ar_prepare(CustomARContext * ctx,
     plan->blocks     = blocks;
     plan->twoshot    = s_twoshot;
     plan->broadcast  = s_broadcast;
+    // The allgather region starts at half the staging allocation, above the scatter region of every call the allocation can serve.
+    plan->ag_offset  = (int64_t) (ctx->staging_size / sizeof(float) / 2) & ~(int64_t) 3;
+    GGML_ASSERT(!s_twoshot || plan->ag_offset >= n_elements);
     for (int rank = 0; rank < nranks; rank++) {
         plan->inputs [rank] = input_ptrs [rank];
         plan->outputs[rank] = output_ptrs[rank];
@@ -987,7 +992,7 @@ void tp_custom_ar_launch_rank(const CustomARPlan * plan, int rank) {
             } else if (plan->twoshot) {
                 k_twoshot_f32<N><<<blocks, kThreads, 0, plan->streams[rank]>>>(
                     ctx->d_rank_data[rank], ctx->rank_signals, ctx->d_signals[rank],
-                    plan->inputs[rank], plan->outputs[rank], rank, n_elements);
+                    plan->inputs[rank], plan->outputs[rank], rank, n_elements, plan->ag_offset);
             } else {
                 k_broadcast_reduce<N><<<blocks, kThreads, 0, plan->streams[rank]>>>(
                     ctx->d_rank_data[rank], ctx->rank_signals, ctx->d_signals[rank],

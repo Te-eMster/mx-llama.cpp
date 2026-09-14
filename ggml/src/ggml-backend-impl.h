@@ -95,6 +95,7 @@ extern "C" {
 
     GGML_API size_t         ggml_backend_meta_n_backends    (ggml_backend_t meta_backend);
     GGML_API size_t         ggml_backend_meta_n_stages      (ggml_backend_t meta_backend);
+    GGML_API void           ggml_backend_meta_graph_begin   (ggml_backend_t meta_backend);
     GGML_API ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
 
     // temporary workaround to statically allocate tensors from a context in a deduplicated way:

@@ -413,6 +413,7 @@ namespace GGUFMeta {
     template bool llama_model_loader::get_arr<std::vector<int32_t>>(enum llm_kv kid, std::vector<int32_t> & result, bool required);
     template bool llama_model_loader::get_arr<std::array<uint32_t, LLAMA_MAX_LAYERS>>(enum llm_kv kid, std::array<uint32_t, LLAMA_MAX_LAYERS> & result, bool required);
     template bool llama_model_loader::get_arr<std::vector<uint32_t>>(enum llm_kv kid, std::vector<uint32_t> & result, bool required);
+    template bool llama_model_loader::get_arr<std::vector<uint64_t>>(enum llm_kv kid, std::vector<uint64_t> & result, bool required);
     template bool llama_model_loader::get_arr<std::array<uint64_t, LLAMA_MAX_PLE_NGRAM>>(enum llm_kv kid, std::array<uint64_t, LLAMA_MAX_PLE_NGRAM> & result, bool required);
     template bool llama_model_loader::get_arr<std::array<uint64_t, LLAMA_MAX_PLE_HEADS>>(enum llm_kv kid, std::array<uint64_t, LLAMA_MAX_PLE_HEADS> & result, bool required);
 
@@ -939,6 +940,10 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
     ggml_tensor * op_tensor = nullptr;
 
     switch (op) {
+        case GGML_OP_CPY:
+            {
+                op_tensor = ggml_cast(ctx, w, GGML_TYPE_F32);
+            } break;
         case GGML_OP_RESHAPE:
             {
                 // A same-shape reshape still creates the view node that buffer-type
@@ -1209,6 +1214,16 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             op = GGML_OP_MUL_MAT_ID;
         } else {
             op = info.op;
+        }
+
+        if (get_arch() == LLM_ARCH_DEEPSEEK41 && t_meta->type == GGML_TYPE_BF16 &&
+                (tn_tensor == LLM_TENSOR_ENGRAM_Q || tn_tensor == LLM_TENSOR_ENGRAM_K) &&
+                tn.suffix != nullptr && strcmp(tn.suffix, "weight") == 0) {
+            const char * cast_device = getenv("LLAMA_DSV41_ENGRAM_CAST_DEVICE");
+            if (cast_device != nullptr && atoi(cast_device) != 0) {
+                op = GGML_OP_CPY;
+                LLAMA_LOG_WARN("%s: experimental Engram F32 cast placement probe for %s\n", __func__, tn.str().c_str());
+            }
         }
 
         // sanity checks

@@ -172,9 +172,14 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
         const int64_t hc_dim          = hc_mult * n_embd;
         const int64_t hc_mix_dim      = (2 + hc_mult) * hc_mult;
 
-        hc_head_fn    = create_tensor(tn(LLM_TENSOR_HC_HEAD_FN,    "weight"), {hc_dim, hc_mult}, 0);
-        hc_head_base  = create_tensor(tn(LLM_TENSOR_HC_HEAD_BASE,  "weight"), {hc_mult}, 0);
-        hc_head_scale = create_tensor(tn(LLM_TENSOR_HC_HEAD_SCALE, "weight"), {1}, 0);
+        const int head_flags = dspark_markov_w1 ? TENSOR_NOT_REQUIRED : 0;
+        hc_head_fn    = create_tensor(tn(LLM_TENSOR_HC_HEAD_FN,    "weight"), {hc_dim, hc_mult}, head_flags);
+        hc_head_base  = create_tensor(tn(LLM_TENSOR_HC_HEAD_BASE,  "weight"), {hc_mult}, head_flags);
+        hc_head_scale = create_tensor(tn(LLM_TENSOR_HC_HEAD_SCALE, "weight"), {1}, head_flags);
+        if ((hc_head_fn != nullptr) != (hc_head_base != nullptr) ||
+                (hc_head_fn != nullptr) != (hc_head_scale != nullptr)) {
+            throw std::runtime_error("DSpark output HC tensors must be all present or all absent");
+        }
 
         for (int i = 0; i < n_layer; ++i) {
             auto & layer = layers[i];
@@ -913,6 +918,9 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
     inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
     cb(inpL, "hc_init", -1);
 
+    const bool hc_shift = model.hc_head_fn == nullptr;
+    ggml_tensor * carry_pre = nullptr;
+
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
 
@@ -920,11 +928,17 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
         ggml_tensor * post = nullptr;
         ggml_tensor * comb = nullptr;
 
+        ggml_tensor * attn_pre = nullptr;
         ggml_tensor * cur = build_hc_pre(inpL,
                 layer.hc_attn_fn,
                 layer.hc_attn_scale,
                 layer.hc_attn_base,
-                &post, &comb, il);
+                &post, &comb, il, &attn_pre, hc_shift ? carry_pre : nullptr);
+        if (hc_shift && carry_pre == nullptr) {
+            // The initial one-hot mix selects copy 0.
+            cur = ggml_cont_2d(ctx0, ggml_view_2d(ctx0, inpL, n_embd, inpL->ne[2], inpL->nb[2], 0),
+                    n_embd, inpL->ne[2]);
+        }
         cb(cur, "hc_attn_pre", il);
 
         cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
@@ -940,7 +954,10 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
                 layer.hc_ffn_fn,
                 layer.hc_ffn_scale,
                 layer.hc_ffn_base,
-                &post, &comb, il);
+                &post, &comb, il, &last_ffn_pre, hc_shift ? attn_pre : nullptr);
+        if (hc_shift) {
+            carry_pre = last_ffn_pre;
+        }
         cb(cur, "hc_ffn_pre", il);
 
         cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
@@ -973,7 +990,7 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
         cb(inpL, "l_out", il);
     }
 
-    ggml_tensor * cur = build_hc_head(inpL, model.hc_head_fn, model.hc_head_scale, model.hc_head_base);
+    ggml_tensor * cur = build_head_fold(model, inpL);
     cb(cur, "hc_head", -1);
 
     // confidence head input: the reference scores the pre-norm collapsed hidden state

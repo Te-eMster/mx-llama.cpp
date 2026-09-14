@@ -2089,6 +2089,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    // A new graph starts here, so a meta backend that carries its stage between the splits of one graph begins it on stage 0 again, and the next ubatch does not queue behind the last stage.
+    for (int b = 0; b < sched->n_backends; b++) {
+        if (ggml_backend_is_meta(sched->backends[b])) {
+            ggml_backend_meta_graph_begin(sched->backends[b]);
+        }
+    }
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
