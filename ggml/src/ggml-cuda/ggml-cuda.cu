@@ -992,6 +992,14 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
 
     void * dev_ptr;
     cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
+    if (err == cudaErrorMemoryAllocation && ggml_cuda_repack_try_release_scratch(buft_ctx->device)) {
+        // The repack upload scratch outlives the load until the first compute, so a compute reserve can find it still resident.
+        (void)cudaGetLastError();
+        err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
+        if (err == cudaSuccess) {
+            GGML_LOG_DEBUG("%s: allocation of %.2f MiB on device %d fit after releasing the repack upload scratch\n", __func__, size / 1024.0 / 1024.0, buft_ctx->device);
+        }
+    }
     if (err != cudaSuccess) {
         // clear the error
         (void)cudaGetLastError();
@@ -2084,8 +2092,22 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     bool is_src0_cont_2 = ggml_is_contiguous_2(src0);
     bool is_src1_cont_2 = ggml_is_contiguous_2(src1);
 
+    // A large 2D weight (a BF16 output head is 2.5 GiB as F32) is converted and multiplied in row blocks, so the workspace stays bounded.
+    // Each output row is the product of one weight row, so the blocks give the same rows as one call.
+    static const size_t chunk_budget = [] {
+        const char * e = getenv("GGML_CUDA_CUBLAS_CHUNK_MIB");
+        const size_t mib = e ? size_t(std::max(0, atoi(e))) : 256;
+        return mib ? mib << 20 : SIZE_MAX; // 0 keeps the whole weight in one conversion
+    }();
+    const bool    chunk_src0   = compute_type == GGML_TYPE_F32 && src0->type != compute_type && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+                                 ggml_is_contiguously_allocated(src0) && ggml_nelements(src0)*sizeof(cuda_t) > chunk_budget;
+    const int64_t chunk_rows   = chunk_src0 ? std::max<int64_t>(1, chunk_budget/(ne00*sizeof(cuda_t))) : ne01;
+
     if (src0->type == compute_type) {
         src0_ptr = (const cuda_t *) src0->data;
+    } else if (chunk_src0) {
+        alloc_with_cache_recovery(src0_alloc, std::min(chunk_rows, ne01)*ne00, "source-0 conversion");
+        s01 = ne00;
     } else {
         alloc_with_cache_recovery(src0_alloc, ggml_nelements(src0), "source-0 conversion");
 
@@ -2181,7 +2203,25 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     // Theoretically cublasGemmStridedBatchedEx would always work, even for a single matrix.
     // However, for some old NVIDIA and AMD GPUs the strided/Ex GEMM is much slower,
     //     probably because the internal kernel selection logic is suboptimal.
-    if (compute_type == GGML_TYPE_F32 && ne12 == 1 && ne13 == 1) {
+    if (chunk_src0) {
+        const auto convert_func = traits::convert(src0->type);
+        GGML_ASSERT(convert_func != nullptr);
+        if (!ctx.cublas_chunk_logged) {
+            GGML_LOG_DEBUG("CUDA cuBLAS[%d]: converting %s in blocks of %" PRId64 " rows (%" PRId64 " rows of %" PRId64 " elements)\n",
+                           ctx.device, ggml_type_name(src0->type), chunk_rows, ne01, ne00);
+            ctx.cublas_chunk_logged = true;
+        }
+        for (int64_t r0 = 0; r0 < ne01; r0 += chunk_rows) {
+            const int64_t nr = std::min(chunk_rows, ne01 - r0);
+            convert_func((const char *) src0->data + r0*nb01, src0_alloc.get(), nr*ne00, main_stream);
+            CUBLAS_CHECK(
+                cublasSgemm(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
+                        nr, ne11, ne10,
+                        (const float *) alpha, (const float *) src0_alloc.get(), s01,
+                                               (const float *) src1_ptr, s11,
+                        (const float *) beta,  (float       *) dst_ptr + r0, ne0));
+        }
+    } else if (compute_type == GGML_TYPE_F32 && ne12 == 1 && ne13 == 1) {
         CUBLAS_CHECK(
             cublasSgemm(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
                     ne01, ne11, ne10,

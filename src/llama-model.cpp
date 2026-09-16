@@ -1222,6 +1222,33 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         // are replicated to every dev, which is correct (just wasteful for small constants).
         // The meta backend's compute partitioning derives stage ownership from non-mirrored
         // sources, so this doesn't break correctness.
+        // A mirrored layer weight is only read by its own stage and, at a stage seam, by the neighbouring stage.
+        // The meta backend places the seam between the last AllReduce of the previous layer and the first split weight of the next one, so the ops in that window can run on either stage.
+        // The first layer of a stage therefore also keeps a copy on the previous stage, and the last layer of a stage on the next one.
+        // Naming those lanes in nr[1] lets the meta backend skip the copy on every other lane.
+        // The meta backend aborts at partition time if a node ever reads such a weight on a lane without a copy, and LLAMA_STAGE_LOCAL_MIRROR=0 restores a copy on every lane.
+        static const bool stage_local_mirror = [] {
+            const char * s = getenv("LLAMA_STAGE_LOCAL_MIRROR");
+            return s == nullptr || atoi(s) != 0;
+        }();
+        if (stage_local_mirror && split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && ud->n_stages > 1 &&
+                tensor_name.compare(0, 4, "blk.") == 0 && tc.il < hparams.n_layer() && ud->n_devices <= 32) {
+            uint32_t lanes = 0;
+            for (size_t k = 0; k < tps; k++) {
+                lanes |= 1u << (lane_base + k);
+            }
+            if (stage > 0 && (tc.il == 0 || owning_stage(tc.il - 1, true) != stage)) {
+                for (size_t k = 0; k < tps; k++) {
+                    lanes |= 1u << (lane_base - tps + k);
+                }
+            }
+            if (stage + 1 < ud->n_stages && (tc.il + 1 >= hparams.n_layer() || owning_stage(tc.il + 1, true) != stage)) {
+                for (size_t k = 0; k < tps; k++) {
+                    lanes |= 1u << (lane_base + tps + k);
+                }
+            }
+            split_state.nr[1] = lanes;
+        }
         if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
             GGML_ASSERT(tc.tensor_axis_0 != tensor);
             const ggml_backend_meta_split_state source_split_state = llama_meta_device_get_split_state(tc.tensor_axis_0, userdata);

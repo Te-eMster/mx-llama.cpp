@@ -310,6 +310,26 @@ prefill  214 -> 601 t/s     decode  7.2 -> 21.5 t/s     (-sm layer on the same p
 
 Only multi-stage tensor splits go through this path, layer mode and single-stage splits do not run it, and a model whose layers read only their own caches moves nothing new.
 
+## Stage-local mirrored weights
+
+A multi-stage `-sm tensor` split used to place a full copy of every mirrored weight (norms, routers, unsplit projections) on every card, including cards of stages that never read it.
+llama now names the lanes that read a mirrored layer weight, which are the lanes of its own stage plus the neighbouring stage for the first and last layer of a stage, because the stage seam falls between the last AllReduce of one layer and the first split weight of the next.
+The meta backend allocates, writes and reads the copy only on those lanes, deciding presence through the view root, and a partition-time check aborts if a node would ever run on a lane without a copy.
+Compute placement does not change, and `LLAMA_STAGE_LOCAL_MIRROR=0` restores a copy on every lane.
+Largest card VRAM, on ten MI50 unless noted, greedy outputs with top-5 records bit-identical with the copies on and off, prefill and decode unchanged:
+
+```
+DeepSeek-V4.1-Flash MXFP4   -tps 2, 32k, ub 512, repack on   out of memory at load -> serves with 1.2 GiB free per card
+DeepSeek-V4.1-Flash MXFP4   -tps 2, 32k, ub 512, repack off  31374 -> 30496 MiB
+DeepSeek-V4-Flash MXFP4     -tps 2                            18876 -> 17936 MiB
+DeepSeek-V4-Flash MXFP4     -tps 4, 8 GPUs                    21780 -> 21178 MiB
+Qwen3.8-Flash-Next Q8_0     -tps 2                            17230 -> 16504 MiB
+MiniMax-M2.1 Q8_0           -tps 2                            26501 -> 26357 MiB
+gpt-oss-120b MXFP4          -tps 2, 4 GPUs                    16297 -> 16273 MiB  (guardrail)
+```
+
+The saving is the mirrored mass, so models whose large matrices are all split (gpt-oss, Gemma 4, dense Qwen) change by a few MiB, and layer mode and single-stage splits are untouched.
+
 ## gfx906 kernel tuning
 
 Hardware-specific tuning for gfx906 / VEGA20 (MI50, MI60, Radeon VII, Radeon Pro

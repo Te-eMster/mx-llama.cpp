@@ -2679,6 +2679,66 @@ ggml_tensor * llm_graph_context::build_pos_bias(ggml_tensor * pos_bucket, ggml_t
     return pos_bias;
 }
 
+template <typename mctx_t>
+void llm_graph_context::build_cpy_k(const mctx_t * mctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int il) const {
+    ggml_build_forward_expand(gf, mctx->cpy_k(ctx0, k_cur, k_idxs, il));
+
+    if (mctx->get_kv()->has_replicas()) {
+        kv_rows_written[{ mctx->get_kv(), il, false }] = { k_cur, k_idxs };
+    }
+}
+
+template <typename mctx_t>
+ggml_tensor * llm_graph_context::build_get_k(const mctx_t * mctx, int il) const {
+    const llama_kv_cache * kv = mctx->get_kv();
+
+    const int32_t ir = kv->get_replica_id(il);
+    if (ir < 0) {
+        return mctx->get_k(ctx0, il);
+    }
+
+    // the first reader on the replica's device writes the owner's rows of this graph, so the write sits next to its readers
+    if (kv_replicas_filled.insert({ kv, ir, false }).second) {
+        const auto it = kv_rows_written.find({ kv, kv->get_replica_owner(ir), false });
+        if (it != kv_rows_written.end()) {
+            ggml_build_forward_expand(gf, mctx->cpy_k_replica(ctx0, it->second.cur, it->second.idxs, ir));
+        }
+    }
+
+    return mctx->get_k_replica(ctx0, ir);
+}
+
+template void llm_graph_context::build_cpy_k(const llama_kv_cache_context *, ggml_tensor *, ggml_tensor *, int) const;
+template void llm_graph_context::build_cpy_k(const llama_kv_cache_dsv4_comp_context *, ggml_tensor *, ggml_tensor *, int) const;
+template ggml_tensor * llm_graph_context::build_get_k(const llama_kv_cache_context *, int) const;
+template ggml_tensor * llm_graph_context::build_get_k(const llama_kv_cache_dsv4_comp_context *, int) const;
+
+void llm_graph_context::build_cpy_v(const llama_kv_cache_context * mctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int il) const {
+    ggml_build_forward_expand(gf, mctx->cpy_v(ctx0, v_cur, v_idxs, il));
+
+    if (mctx->get_kv()->has_replicas()) {
+        kv_rows_written[{ mctx->get_kv(), il, true }] = { v_cur, v_idxs };
+    }
+}
+
+ggml_tensor * llm_graph_context::build_get_v(const llama_kv_cache_context * mctx, int il) const {
+    const llama_kv_cache * kv = mctx->get_kv();
+
+    const int32_t ir = kv->get_replica_id(il);
+    if (ir < 0) {
+        return mctx->get_v(ctx0, il);
+    }
+
+    if (kv_replicas_filled.insert({ kv, ir, true }).second) {
+        const auto it = kv_rows_written.find({ kv, kv->get_replica_owner(ir), true });
+        if (it != kv_rows_written.end()) {
+            ggml_build_forward_expand(gf, mctx->cpy_v_replica(ctx0, it->second.cur, it->second.idxs, ir));
+        }
+    }
+
+    return mctx->get_v_replica(ctx0, ir);
+}
+
 ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * q,
          ggml_tensor * k,
@@ -2965,15 +3025,15 @@ ggml_tensor * llm_graph_context::build_attn(
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        build_cpy_k(mctx_cur, k_cur, k_idxs, il);
+        build_cpy_v(mctx_cur, v_cur, v_idxs, il);
     }
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    ggml_tensor * k = build_get_k(mctx_cur, il);
+    ggml_tensor * v = build_get_v(mctx_cur, il);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
@@ -3025,8 +3085,8 @@ void llm_graph_context::build_attn_store_kv(
     const auto & k_idxs = inp->get_k_idxs();
     const auto & v_idxs = inp->get_v_idxs();
 
-    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-    ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+    build_cpy_k(mctx_cur, k_cur, k_idxs, il);
+    build_cpy_v(mctx_cur, v_cur, v_idxs, il);
 }
 
 static std::unique_ptr<llm_graph_input_attn_k> build_attn_inp_k_impl(
@@ -3084,13 +3144,13 @@ ggml_tensor * llm_graph_context::build_attn(
     {
         const auto & k_idxs = inp->get_k_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+        build_cpy_k(mctx_cur, k_cur, k_idxs, il);
     }
 
     const auto & kq_mask = inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * k = build_get_k(mctx_cur, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
@@ -3143,7 +3203,7 @@ ggml_tensor * llm_graph_context::build_attn(
     {
         const auto & k_idxs = inp->get_k_idxs_mla();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+        build_cpy_k(mctx_cur, k_cur, k_idxs, il);
     }
 
     const auto & kq_mask = inp->get_kq_mask_mla();
@@ -3175,7 +3235,7 @@ ggml_tensor * llm_graph_context::build_attn(
     kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * k = build_get_k(mctx_cur, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_top_k, sinks, v_mla, top_k->ne[0], kq_scale, il);
@@ -3242,20 +3302,20 @@ ggml_tensor * llm_graph_context::build_attn(
     if (k_cur) {
         const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+        build_cpy_k(mctx_cur, k_cur, k_idxs, il);
     }
 
     if (v_cur) {
         const auto & v_idxs = is_swa ? inp->get_v_idxs_swa() : inp->get_v_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        build_cpy_v(mctx_cur, v_cur, v_idxs, il);
     }
 
     const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    ggml_tensor * k = build_get_k(mctx_cur, il);
+    ggml_tensor * v = build_get_v(mctx_cur, il);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
@@ -3318,14 +3378,14 @@ ggml_tensor * llm_graph_context::build_attn(
     if (k_cur) {
         const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+        build_cpy_k(mctx_cur, k_cur, k_idxs, il);
     }
 
     const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
 
     // MLA-style attention: the cached K is used as V
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * k = build_get_k(mctx_cur, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);

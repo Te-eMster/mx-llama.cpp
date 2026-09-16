@@ -1583,6 +1583,7 @@ struct ggml_backend_cuda_context {
     size_t q8_1_cache_misses = 0;
     size_t q8_1_cache_peak   = 0; // most entries alive at once, over the run
     bool q8_1_cache_pressure_logged = false;
+    bool cublas_chunk_logged = false;
     void q8_1_cache_reset() {
         q8_1_cache.clear();
     }

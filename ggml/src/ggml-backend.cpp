@@ -1761,6 +1761,44 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 }
 
                 if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                    // a full-size view (a reshape of a layer output) is staged as a view of its source's copy, so the two cross once
+                    static const bool share_view_inputs = [] {
+                        const char * e = getenv("GGML_SCHED_SHARE_VIEW_INPUTS");
+                        return e == NULL || atoi(e) != 0;
+                    }();
+                    struct ggml_tensor * root = src->view_src;
+                    const bool share_root = share_view_inputs && root != NULL && tensor_id_copy(src_id, cur_backend_id, 0) == NULL &&
+                        src->view_offs == 0 && ggml_nbytes(src) == ggml_nbytes(root) && ggml_is_contiguous(src) && ggml_is_contiguous(root) &&
+                        !(root->flags & GGML_TENSOR_FLAG_INPUT) && sched->hv_tensor_backend_ids[hash_id(root)] == src_backend_id &&
+                        !ggml_backend_sched_buffer_supported(sched, root, cur_backend_id);
+                    if (share_root) {
+                        const size_t root_id = hash_id(root);
+                        ggml_backend_t backend = sched->backends[cur_backend_id];
+                        if (tensor_id_copy(root_id, cur_backend_id, 0) == NULL) {
+                            for (int c = 0; c < sched->n_copies; c++) {
+                                struct ggml_tensor * root_copy = ggml_dup_tensor_layout(sched->ctx, root);
+                                ggml_format_name(root_copy, "%s#%s#%d", ggml_backend_name(backend), root->name, c);
+                                if (sched->n_copies > 1) {
+                                    ggml_set_input(root_copy);
+                                    ggml_set_output(root_copy); // prevent ggml-alloc from overwriting the tensor
+                                }
+                                tensor_id_copy(root_id, cur_backend_id, c) = root_copy;
+                                SET_CAUSE(root_copy, "4.cpy");
+                            }
+                            int n_inputs = split->n_inputs++;
+                            if (n_inputs >= split->inputs_capacity) {
+                                ggml_backend_sched_split_inputs_grow(split);
+                            }
+                            split->inputs[n_inputs] = root;
+                        }
+                        for (int c = 0; c < sched->n_copies; c++) {
+                            struct ggml_tensor * tensor_copy = ggml_view_4d(sched->ctx, tensor_id_copy(root_id, cur_backend_id, c),
+                                src->ne[0], src->ne[1], src->ne[2], src->ne[3], src->nb[1], src->nb[2], src->nb[3], 0);
+                            ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
+                            tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
+                            SET_CAUSE(tensor_copy, "4.cpy");
+                        }
+                    }
                     // create a copy of the input in the split's backend
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[cur_backend_id];

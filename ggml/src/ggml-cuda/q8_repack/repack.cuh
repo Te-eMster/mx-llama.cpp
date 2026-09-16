@@ -29,6 +29,10 @@ inline void ggml_cuda_repack_set_tensor_async(
 inline void ggml_cuda_repack_async_release(int) {
 }
 
+inline bool ggml_cuda_repack_try_release_scratch(int) {
+    return false;
+}
+
 inline bool ggml_cuda_repack_mmv_fusion_supported(const ggml_tensor *) {
     return false;
 }
@@ -79,6 +83,8 @@ bool ggml_cuda_repack_mul_mat_should_fire(const ggml_tensor * src0);
 void ggml_cuda_repack_set_tensor_async(int device, cudaStream_t stream,
     ggml_tensor * tensor, const void * data, size_t offset, size_t size);
 void ggml_cuda_repack_async_release(int device);
+// Frees the device scratch early when no tensor upload is in progress, and returns whether any VRAM was released.
+bool ggml_cuda_repack_try_release_scratch(int device);
 
 // Dense fused MMV admits Q8_0 and MXFP4 only.
 bool ggml_cuda_repack_mmv_fusion_supported(const ggml_tensor * src0);

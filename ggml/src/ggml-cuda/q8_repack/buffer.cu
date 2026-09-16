@@ -471,6 +471,21 @@ void ggml_cuda_repack_set_tensor_async(int device, cudaStream_t stream,
     }
 }
 
+bool ggml_cuda_repack_try_release_scratch(int device) {
+    // The scratch is sized to the largest repacked tensor of this device, which on a MoE layer split is a whole expert tensor.
+    // Compute reserves run before the first graph compute, so an allocation that fails for lack of VRAM can retry after this frees it.
+    std::lock_guard<std::mutex> lock(s_async_mutex);
+    repack_async_state & st = s_async[device];
+    if (st.scratch == nullptr || st.cur != nullptr) {
+        return false;
+    }
+    ggml_cuda_set_device(device);
+    CUDA_CHECK(cudaFree(st.scratch));
+    st.scratch = nullptr;
+    st.cap     = 0;
+    return true;
+}
+
 void ggml_cuda_repack_async_release(int device) {
     // Drain any in-flight pinned uploads from the sync/meta path first - this
     // runs at the first graph compute, so nothing may still be uploading.

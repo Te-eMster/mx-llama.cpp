@@ -409,6 +409,10 @@ static void dsv4_state_read_k_cache(
 
         dsv4_state_read_tensor_streams(io, kv->get_k_storage(il), kv_size, n_rows_ref, s0, ns);
     }
+
+    for (uint32_t s = s0; s < s0 + ns; ++s) {
+        kv->sync_replicas(s, 0, n_rows_ref);
+    }
 }
 
 static std::string dsv4_plan_positions(const std::vector<int32_t> & values) {
@@ -1332,13 +1336,26 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
 
     const bool unified_compressed = false;
 
+    // V4.1 layers after a source reuse the source's compressed cache
+    const auto filter_comp = [&](uint32_t ratio) -> layer_filter_cb {
+        return [&model, &filter, ratio](int32_t il) {
+            const auto & hp = model.hparams;
+            return (!filter || filter(il)) && hp.dsv4_compress_ratios[il] == ratio && (hp.dsv41_n_kv_source == 0 || hp.dsv41_kv_source_for(il) >= 0);
+        };
+    };
+
+    const layer_reuse_cb reuse_comp = [&model](int32_t il) -> int32_t {
+        const auto & hp = model.hparams;
+        return hp.dsv41_n_kv_source > 0 && !hp.dsv41_is_kv_source(il) ? hp.dsv41_kv_source_for(il) : -1;
+    };
+
     LLAMA_LOG_INFO("%s: creating DSV4 indexed compressed KV cache, ratio %u, size = %u cells\n",
             __func__, model.hparams.dsv4_ratio_idx, dsv4_comp_size(kv_size, model.hparams.dsv4_ratio_idx));
 
     kv_csa = std::make_unique<llama_kv_cache>(
             model, hparams_csa, type_k, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, model.hparams.dsv4_ratio_idx), 256u), n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr);
+            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_comp(model.hparams.dsv4_ratio_idx), reuse_comp, nullptr);
 
     LLAMA_LOG_INFO("%s: creating DSV4 plain compressed KV cache, ratio %u, size = %u cells\n",
             __func__, model.hparams.dsv4_ratio_plain, dsv4_comp_size(kv_size, model.hparams.dsv4_ratio_plain));
@@ -1346,7 +1363,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     kv_hca = std::make_unique<llama_kv_cache>(
             model, hparams_hca, type_k, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, model.hparams.dsv4_ratio_plain), 256u), n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_hca, nullptr, nullptr);
+            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_comp(model.hparams.dsv4_ratio_plain), reuse_comp, nullptr);
 
     LLAMA_LOG_INFO("%s: creating DSV4 lightning-indexer KV cache, size = %u cells\n",
             __func__, dsv4_comp_size(kv_size, model.hparams.dsv4_ratio_idx));
@@ -1798,6 +1815,9 @@ void llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data) {
                 for (uint32_t il : kv->get_layer_ids()) {
                     dsv4_clear_tensor_stream(kv->get_k_storage(il), (uint32_t) seq_id);
                 }
+                for (ggml_tensor * k : kv->get_k_replica_storage()) {
+                    dsv4_clear_tensor_stream(k, (uint32_t) seq_id);
+                }
             }
         };
 
@@ -2044,6 +2064,18 @@ ggml_tensor * llama_kv_cache_dsv4_comp_context::get_k(ggml_context * ctx, int32_
 
 ggml_tensor * llama_kv_cache_dsv4_comp_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
     return kv->cpy_k(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
+}
+
+const llama_kv_cache * llama_kv_cache_dsv4_comp_context::get_kv() const {
+    return kv;
+}
+
+ggml_tensor * llama_kv_cache_dsv4_comp_context::get_k_replica(ggml_context * ctx, int32_t ir) const {
+    return kv->get_k_replica(ctx, ir, n_kv, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_dsv4_comp_context::cpy_k_replica(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t ir) const {
+    return kv->cpy_k_replica(ctx, k_cur, k_idxs, ir);
 }
 
 ggml_tensor * llama_kv_cache_dsv4_comp_context::build_input_k_rot(ggml_context * ctx) const {

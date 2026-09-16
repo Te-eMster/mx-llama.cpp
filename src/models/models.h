@@ -1292,7 +1292,7 @@ struct llama_model_deepseek4 : public llama_model_base {
                 float kq_scale,
                 int il) const;
 
-        // il_kv names the layer whose compressed rows are read, which V4.1 needs because its layers reuse the cache of the source layer before them. idx_tier picks between the two compressed tiers.
+        // idx_tier picks between the two compressed tiers.
         ggml_tensor * build_hca_attention(
                 llm_graph_input_dsv4 * inp_dsv4,
                 llm_graph_input_dsv4_raw * inp_attn,
@@ -1301,7 +1301,6 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * sinks,
                 float kq_scale,
                 int il,
-                int il_kv,
                 bool idx_tier) const;
 
         ggml_tensor * build_raw_attention(

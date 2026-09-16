@@ -794,10 +794,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
         ggml_tensor * sinks,
         float kq_scale,
         int il,
-        int il_kv,
         bool idx_tier) const {
-    // il_kv is the layer that owns the compressed rows.
-    // For V4 that is this layer; V4.1 has the layers after a source read the source's cache, which is the only place they differ.
+    // V4.1 layers after a source reuse the source's compressed cache, which the cache resolves from il.
     const auto & inp_hca = idx_tier ? inp_dsv4->get_csa() : inp_dsv4->get_hca();
     GGML_ASSERT(inp_hca.kq_mask);
 
@@ -817,7 +815,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
     ggml_tensor * raw_k = mctx_raw->get_k(ctx0, il);
     cb(raw_k, "hca_raw_k", il);
 
-    ggml_tensor * hca_k = (idx_tier ? inp_dsv4->mctx->get_csa() : inp_dsv4->mctx->get_hca())->get_k(ctx0, il_kv);
+    ggml_tensor * hca_k = build_get_k(idx_tier ? inp_dsv4->mctx->get_csa() : inp_dsv4->mctx->get_hca(), il);
     const int64_t n_hca = inp_hca.kq_mask->ne[0];
     GGML_ASSERT(n_hca > 0);
     GGML_ASSERT(n_hca <= hca_k->ne[2]);
@@ -1196,8 +1194,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
         }
 
         const auto * tier_kv = (v41 && tier_idx) ? inp_dsv4->mctx->get_csa() : inp_dsv4->mctx->get_hca();
-        ggml_build_forward_expand(gf, tier_kv->cpy_k(ctx0,
-                    kv_comp_hca, tier.state_write_idxs, il));
+        build_cpy_k(tier_kv, kv_comp_hca, tier.state_write_idxs, il);
     }
 
     if (pooled && tier.state_pos) {
@@ -1263,7 +1260,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
     } else if (ratio != 0 && tier.kq_mask && !(v41 && compress_off)) {
         // the compressed rows live on the source layer, which for V4 is this layer itself
         out = build_hca_attention(inp_dsv4, inp_attn, q, kv, layer.attn_sinks,
-                1.0f/sqrtf(float(n_embd_head)), il, kv_src, v41 && tier_idx);
+                1.0f/sqrtf(float(n_embd_head)), il, v41 && tier_idx);
     } else {
         out = build_raw_attention(inp_attn, q, kv, layer.attn_sinks,
                 1.0f/sqrtf(float(n_embd_head)), il);

@@ -753,6 +753,33 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
 
+// A statically allocated MIRRORED tensor may name the lanes that hold a copy in nr[1], a bit per lane, with 0 meaning every lane.
+// Only leaf tensors outside a compute buffer honor it, because a compute tensor inherits its sources' split state and must still exist on every lane of its stage.
+static uint32_t ggml_backend_meta_mirror_lane_mask(const ggml_backend_meta_split_state & split_state, const struct ggml_tensor * tensor) {
+    if (split_state.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED || split_state.n_segments != 1) {
+        return 0;
+    }
+    if (tensor->op != GGML_OP_NONE || tensor->view_src != nullptr || tensor->buffer == nullptr ||
+            ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        return 0;
+    }
+    return split_state.nr[1];
+}
+
+// True when lane j holds no copy of the MIRRORED tensor that owns this tensor's data, so reads, writes and compute must not touch that lane.
+// A view carries its full shape on every lane, so presence is decided by the view root, which is where the mask left an empty tensor.
+static bool ggml_backend_meta_mirror_lane_absent(const struct ggml_tensor * tensor, size_t j) {
+    const ggml_tensor * root = tensor;
+    while (root->view_src != nullptr) {
+        root = root->view_src;
+    }
+    if (ggml_nelements(root) == 0 || root->buffer == nullptr || !ggml_backend_buffer_is_meta(root->buffer)) {
+        return false;
+    }
+    const ggml_tensor * simple_root = ggml_backend_meta_buffer_simple_tensor(root, j);
+    return simple_root != nullptr && ggml_nelements(simple_root) == 0;
+}
+
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         ggml_backend_meta_simple_tensor_container & stc, const struct ggml_tensor * tensor, bool assume_sync) {
     // FIXME Currently this function preserves/erases the information in n_segments and nr in an inconsistent way.
@@ -1571,6 +1598,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         ne[k] = tensor->ne[k];
         nb[k] = tensor->nb[k];
     }
+    const uint32_t mirror_lanes = &stc == &buf_ctx->stc_static ? ggml_backend_meta_mirror_lane_mask(split_state, tensor) : 0;
 
     std::vector<ggml_tensor *> simple_tensors;
     simple_tensors.reserve(n_simple_bufs);
@@ -1581,6 +1609,11 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         if ((simple_buf != nullptr) && ggml_backend_buffer_is_multi_buffer(simple_buf)) {
             // see https://github.com/ggml-org/llama.cpp/issues/22197
             GGML_ABORT("multi buffers are not supported by the meta backend");
+        }
+
+        // A lane outside the mirror mask gets an empty tensor, which allocates nothing.
+        if (mirror_lanes != 0) {
+            ne[0] = ((mirror_lanes >> j) & 1) ? tensor->ne[0] : 0;
         }
 
         if (split_dim >= 0 && split_dim < GGML_MAX_DIMS) {
@@ -1803,6 +1836,9 @@ static void ggml_backend_meta_buffer_memset_tensor(
         }
         case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
             for (size_t j = 0; j < n_bufs; j++) {
+                if (ggml_backend_meta_mirror_lane_absent(tensor, j)) {
+                    continue;
+                }
                 ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
                 ggml_backend_tensor_memset(simple_tensor, value, offset, size);
             }
@@ -1965,6 +2001,9 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
         } break;
         case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
             for (size_t j = 0; j < n_bufs; j++) {
+                if (ggml_backend_meta_mirror_lane_absent(tensor, j)) {
+                    continue;
+                }
                 ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
                 ggml_backend_tensor_set(simple_tensor, data, offset, size);
             }
@@ -2093,7 +2132,12 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
         } break;
         case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
             // TODO other simple backend may be better
-            const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, 0);
+            // The first lane that holds a copy, which is lane 0 unless a mirror mask left it empty.
+            size_t j = 0;
+            while (j + 1 < n_bufs && ggml_backend_meta_mirror_lane_absent(tensor, j)) {
+                j++;
+            }
+            const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
             ggml_backend_tensor_get(simple_tensor, data, offset, size);
         } break;
         default: {
@@ -3130,6 +3174,9 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
         } break;
         case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
             for (size_t j = 0; j < n_backends; j++) {
+                if (ggml_backend_meta_mirror_lane_absent(tensor, j)) {
+                    continue;
+                }
                 ggml_backend_tensor_set_async(
                     ggml_backend_meta_simple_backend(backend, j), ggml_backend_meta_buffer_simple_tensor(tensor, j), data, offset, size);
             }
@@ -3192,6 +3239,13 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
                         simple_backend_idx = lane;
                     }
                 }
+            }
+            if (ggml_backend_meta_mirror_lane_absent(tensor, simple_backend_idx)) {
+                size_t j = 0;
+                while (j + 1 < n_backends && ggml_backend_meta_mirror_lane_absent(tensor, j)) {
+                    j++;
+                }
+                simple_backend_idx = j;
             }
             ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, simple_backend_idx);
             const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, simple_backend_idx);
@@ -4002,6 +4056,41 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 i_start = cgraph->n_nodes;
             }
             GGML_ASSERT(i_start == cgraph->n_nodes);
+
+            // A MIRRORED weight with a lane mask has no copy outside its lanes, so every node that reads it must run on a stage whose lanes all hold one.
+            // Placement is decided above from split weights only, so a mask that misses a stage would read an empty tensor, and this stops it at partition time instead.
+            if (backend_ctx->n_stages > 1) {
+                for (size_t k = 0; k < n_subgraphs; k++) {
+                    const int    off_lo  = (int) backend_ctx->backend_configs[0].cgraphs[k].offset;
+                    const int    off_hi  = k + 1 < n_subgraphs ? (int) backend_ctx->backend_configs[0].cgraphs[k + 1].offset : cgraph->n_nodes;
+                    const size_t lane_lo = backend_ctx->subgraphs[k].stage * backend_ctx->tps;
+                    for (int i = off_lo; i < off_hi; i++) {
+                        const ggml_tensor * node = cgraph->nodes[i];
+                        // A pure view reads no data, and the node that consumes it is checked at its own stage through the view root.
+                        if (is_pure_view_op(node->op)) {
+                            continue;
+                        }
+                        for (int sx = 0; sx < GGML_MAX_SRC; sx++) {
+                            const ggml_tensor * src = node->src[sx];
+                            while (src != nullptr && src->view_src != nullptr) {
+                                src = src->view_src;
+                            }
+                            if (src == nullptr || src->op != GGML_OP_NONE || src->buffer == nullptr ||
+                                    !ggml_backend_buffer_is_meta(src->buffer) ||
+                                    ggml_backend_buffer_get_usage(src->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+                                continue;
+                            }
+                            for (size_t lane = lane_lo; lane < lane_lo + backend_ctx->tps; lane++) {
+                                if (ggml_backend_meta_mirror_lane_absent(src, lane) &&
+                                        ggml_backend_meta_get_split_state(src, /*assume_sync =*/ true).axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                                    GGML_ABORT("meta: node '%s' runs on stage %zu but lane %zu holds no copy of its mirrored weight '%s', set LLAMA_STAGE_LOCAL_MIRROR=0",
+                                               node->name, backend_ctx->subgraphs[k].stage, lane, src->name);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             if (carry_stage && !fragment) {
                 backend_ctx->frag_last_stage = current_stage;

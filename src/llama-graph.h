@@ -11,6 +11,7 @@
 #include <set>
 #include <functional>
 #include <map>
+#include <tuple>
 
 struct ggml_cgraph;
 struct ggml_context;
@@ -21,6 +22,7 @@ struct llama_layer;
 
 struct llama_memory_context_i;
 
+class llama_kv_cache;
 class llama_kv_cache_context;
 class llama_kv_cache_dsa_context;
 class llama_kv_cache_dsa_iswa_context;
@@ -1053,6 +1055,15 @@ struct llm_graph_context {
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
 
+    // rows this graph wrote per (cache, layer, is V), and the replicas already filled from them
+    struct kv_rows {
+        ggml_tensor * cur;
+        ggml_tensor * idxs;
+    };
+
+    mutable std::map<std::tuple<const llama_kv_cache *, int32_t, bool>, kv_rows> kv_rows_written;
+    mutable std::set<std::tuple<const llama_kv_cache *, int32_t, bool>> kv_replicas_filled;
+
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
 
@@ -1180,6 +1191,15 @@ struct llm_graph_context {
     //
     // attention
     //
+
+    // cache writes and reads that keep the replica of a reused layer in step (see llama_kv_cache::get_replica_id)
+    template <typename mctx_t>
+    void build_cpy_k(const mctx_t * mctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int il) const;
+    template <typename mctx_t>
+    ggml_tensor * build_get_k(const mctx_t * mctx, int il) const;
+
+    void build_cpy_v(const llama_kv_cache_context * mctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int il) const;
+    ggml_tensor * build_get_v(const llama_kv_cache_context * mctx, int il) const;
 
     ggml_tensor * build_attn_mha(
             ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]

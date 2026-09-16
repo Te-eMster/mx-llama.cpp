@@ -166,6 +166,22 @@ public:
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
 
+    // A layer that reuses another layer's cache from a different device reads a replica on its own device.
+    // Replicas take the same rows in the same graph (llm_graph_context::build_cpy_k and build_get_k), so they stay bit-identical.
+    // LLAMA_KV_REPLICA=0 reads the owner's device instead.
+    bool has_replicas() const;
+    int32_t get_replica_id(int32_t il) const; // replica read by layer il, or -1
+    int32_t get_replica_owner(int32_t ir) const;
+    std::vector<ggml_tensor *> get_k_replica_storage() const;
+
+    ggml_tensor * get_k_replica(ggml_context * ctx, int32_t ir, uint32_t n_kv, const slot_info & sinfo) const;
+    ggml_tensor * get_v_replica(ggml_context * ctx, int32_t ir, uint32_t n_kv, const slot_info & sinfo) const;
+    ggml_tensor * cpy_k_replica(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t ir) const;
+    ggml_tensor * cpy_v_replica(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t ir) const;
+
+    // copy rows [r0, r1) of stream strm from the owners to their replicas, after a write outside a graph
+    void sync_replicas(uint32_t strm, uint32_t r0, uint32_t r1);
+
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
     // state_read, plus the cells the restored tokens were placed in
@@ -313,6 +329,27 @@ private:
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
 
+    struct kv_replica {
+        uint32_t il; // owner layer
+        ggml_backend_dev_t dev;
+
+        ggml_tensor * k;
+        ggml_tensor * v;
+
+        std::vector<ggml_tensor *> k_stream;
+        std::vector<ggml_tensor *> v_stream;
+    };
+
+    std::vector<kv_replica> replicas;
+
+    // model layer id -> replica id, for layers that read a replica
+    std::unordered_map<int32_t, int32_t> map_replica_ids;
+
+    ggml_tensor * get_k_view(ggml_context * ctx, ggml_tensor * k, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    ggml_tensor * get_v_view(ggml_context * ctx, ggml_tensor * v, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    ggml_tensor * cpy_k_into(ggml_context * ctx, ggml_tensor * k, ggml_tensor * k_cur, ggml_tensor * k_idxs) const;
+    ggml_tensor * cpy_v_into(ggml_context * ctx, ggml_tensor * v, ggml_tensor * v_cur, ggml_tensor * v_idxs) const;
+
     size_t total_size() const;
 
     size_t size_k_bytes() const;
@@ -406,6 +443,14 @@ public:
     //   - v_idxs [n_tokens] or [n_tokens*n_embd_v_gqa] depending if V cache is transposed
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const;
+
+    // see llama_kv_cache::get_replica_id()
+    const llama_kv_cache * get_kv() const;
+
+    ggml_tensor * get_k_replica(ggml_context * ctx, int32_t ir) const;
+    ggml_tensor * get_v_replica(ggml_context * ctx, int32_t ir) const;
+    ggml_tensor * cpy_k_replica(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t ir) const;
+    ggml_tensor * cpy_v_replica(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t ir) const;
 
     // create destination indices for each head of the current batch for where it would be written in the KV cache
     // the indices address the global KV cache (not per stream) - this is not relevant for the user of this API, but
