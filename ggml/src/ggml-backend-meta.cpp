@@ -2736,6 +2736,15 @@ struct ggml_backend_meta_context {
     uint64_t prof_ns_close   = 0;
     uint64_t prof_ns_sync    = 0;
     uint64_t prof_ns_wall0   = 0;
+    // Replayed whole-token graphs form their own class: prefill and uncaptured
+    // shapes would otherwise average into the per-token numbers. launch is the
+    // host time issuing the recorded graphs, seam the stage transfers between them.
+    bool     prof_last_tg       = false;
+    uint64_t prof_tg_calls      = 0;
+    uint64_t prof_tg_ns_compute = 0;
+    uint64_t prof_tg_ns_launch  = 0;
+    uint64_t prof_tg_ns_seam    = 0;
+    uint64_t prof_tg_ns_sync    = 0;
 
     void prof_report() const {
         if (!prof || prof_calls == 0) {
@@ -2756,6 +2765,21 @@ struct ggml_backend_meta_context {
             100.0 * prof_ns_compute / wall,
             100.0 * prof_ns_sync    / wall,
             wall / 1e9);
+        if (prof_tg_calls > 0) {
+            const double t = (double) prof_tg_calls;
+            const double o = (double) (prof_calls - prof_tg_calls);
+            fprintf(stderr,
+                "[meta-prof] replayed tokens=%llu | per token: compute=%.1f us (launch=%.1f seam=%.1f)  sync=%.1f us | "
+                "other calls=%llu: compute=%.1f us  sync=%.1f us\n",
+                (unsigned long long) prof_tg_calls,
+                prof_tg_ns_compute / t / 1e3,
+                prof_tg_ns_launch  / t / 1e3,
+                prof_tg_ns_seam    / t / 1e3,
+                prof_tg_ns_sync    / t / 1e3,
+                (unsigned long long) (prof_calls - prof_tg_calls),
+                o > 0 ? (prof_ns_compute - prof_tg_ns_compute) / o / 1e3 : 0.0,
+                o > 0 ? (prof_ns_sync    - prof_tg_ns_sync)    / o / 1e3 : 0.0);
+        }
     }
 
     // Sync-fallback scratch for set_tensor_async on layouts the chunk-by-chunk path can't handle:
@@ -3327,6 +3351,7 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
     }
     ggml_backend_meta_context * prof_ctx = (ggml_backend_meta_context *) backend->context;
     ggml_meta_prof_scope prof_guard(&prof_ctx->prof_ns_sync, prof_ctx->prof);
+    ggml_meta_prof_scope prof_guard_tg(&prof_ctx->prof_tg_ns_sync, prof_ctx->prof && prof_ctx->prof_last_tg);
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     for (size_t i = 0; i < n_backends; i++) {
         ggml_backend_synchronize(ggml_backend_meta_simple_backend(backend, i));
@@ -3361,6 +3386,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     ggml_meta_chunk_trace_guard chunk_guard(backend_ctx->dbg_chunk, cgraph);
     ggml_meta_prof_scope prof_guard(&backend_ctx->prof_ns_compute, backend_ctx->prof);
     backend_ctx->prof_calls += backend_ctx->prof ? 1 : 0;
+    backend_ctx->prof_last_tg = false;
+    if (backend_ctx->prof && (backend_ctx->prof_calls % 512) == 0) {
+        backend_ctx->prof_report();
+    }
 
     // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
     const bool needs_rebuild = (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid);
@@ -4965,6 +4994,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 if (!ready) { break; }
             }
             if (ready) {
+                const uint64_t prof_t0 = backend_ctx->prof ? ggml_meta_prof_now() : 0;
+                uint64_t prof_seam = 0;
                 for (const auto & r : tge->runs) {
                     const size_t lane_lo = r.stage * backend_ctx->tps;
                     for (size_t k = 0; k < backend_ctx->tps; k++) {
@@ -4973,11 +5004,23 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     }
                     if (r.seam != SIZE_MAX) {
                         const size_t stage_b = backend_ctx->subgraphs[r.seam + 1].stage;
+                        const uint64_t prof_ts = backend_ctx->prof ? ggml_meta_prof_now() : 0;
                         const ggml_status st = stage_transfer(r.seam, r.stage, stage_b);
+                        if (backend_ctx->prof) {
+                            prof_seam += ggml_meta_prof_now() - prof_ts;
+                        }
                         if (st != GGML_STATUS_SUCCESS) {
                             return st;
                         }
                     }
+                }
+                if (backend_ctx->prof) {
+                    const uint64_t prof_t1 = ggml_meta_prof_now();
+                    backend_ctx->prof_tg_calls++;
+                    backend_ctx->prof_tg_ns_launch  += (prof_t1 - prof_t0) - prof_seam;
+                    backend_ctx->prof_tg_ns_seam    += prof_seam;
+                    backend_ctx->prof_tg_ns_compute += prof_t1 - prof_guard.t0;
+                    backend_ctx->prof_last_tg = true;
                 }
                 if (tge->covered >= backend_ctx->n_subgraphs) {
                     return GGML_STATUS_SUCCESS;
