@@ -5616,7 +5616,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    if (graph->is_enabled() && !g_cuda_outer_capture) {
+    if (graph->is_enabled() && !g_cuda_outer_capture && !cuda_ctx->graphs_owner_disabled) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
@@ -6920,6 +6920,17 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// Turn this backend's own graph cache off for good.
+// An owner that records and replays a whole token per lane calls it, because the per-subgraph captures underneath cover the same kernels and never amortize.
+static void ggml_backend_cuda_graph_cache_disable(ggml_backend_t backend) {
+#ifdef USE_CUDA_GRAPH
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    cuda_ctx->graphs_owner_disabled = true;
+#else
+    GGML_UNUSED(backend);
+#endif
+}
+
 // Begin recording every kernel this thread issues on `backend`'s stream.
 // ThreadLocal mode so the N lanes can capture their own streams concurrently.
 static bool ggml_backend_cuda_token_capture_begin(ggml_backend_t backend) {
@@ -6981,6 +6992,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_launch_rank") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_launch_rank;
+    }
+    if (strcmp(name, "ggml_backend_graph_cache_disable") == 0) {
+        return (void *) ggml_backend_cuda_graph_cache_disable;
     }
     if (strcmp(name, "ggml_backend_token_capture_begin") == 0) {
         return (void *)ggml_backend_cuda_token_capture_begin;
