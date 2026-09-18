@@ -2232,9 +2232,17 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
     std::vector<ggml_backend_buffer_t> bufs;
     bufs.reserve(n_simple_bufts);
     for (size_t i = 0; i < n_simple_bufts; i++) {
-        bufs.push_back(ggml_backend_buft_alloc_buffer(ggml_backend_meta_buft_simple_buft(buft, i), size));
-        GGML_ASSERT(bufs.back() != nullptr);
-        max_size = std::max(max_size, ggml_backend_buffer_get_size(bufs.back()));
+        ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(ggml_backend_meta_buft_simple_buft(buft, i), size);
+        if (buf == nullptr) {
+            // A lane that cannot allocate is a failed buffer, not a fatal error.
+            // Reporting it the way every other buffer type does lets the caller fall back or fit a smaller layout, instead of aborting a context that was still being built.
+            for (ggml_backend_buffer_t allocated : bufs) {
+                ggml_backend_buffer_free(allocated);
+            }
+            return nullptr;
+        }
+        bufs.push_back(buf);
+        max_size = std::max(max_size, ggml_backend_buffer_get_size(buf));
     }
     ggml_backend_meta_buffer_context * buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, bufs);
 

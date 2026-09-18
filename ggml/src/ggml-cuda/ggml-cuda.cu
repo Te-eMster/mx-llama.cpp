@@ -7138,6 +7138,16 @@ static ggml_backend_t ggml_backend_cuda_init_impl(int device, bool copy_only) {
         /* .context = */ ctx,
     };
 
+    // The BLAS handle and its library state take device memory on first use, which is after the compute buffers were sized.
+    // Creating it here lets the reserve see that memory, so a layout that leaves no room for it fails at reserve instead of at the first prompt.
+    static const bool eager_blas_handle = [] {
+        const char * s = getenv("GGML_CUDA_EAGER_BLAS_HANDLE");
+        return s == nullptr || atoi(s) != 0;
+    }();
+    if (eager_blas_handle && !copy_only) {
+        ctx->cublas_handle();
+    }
+
     return cuda_backend;
 }
 
