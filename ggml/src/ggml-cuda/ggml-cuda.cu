@@ -4326,6 +4326,36 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         }
     }
 
+    // The bias of the gate arrives through a VIEW node that the graph builder places between the MUL and the ADD.
+    if (ops.size() == 5 && ops.begin()[0] == GGML_OP_MUL && ops.begin()[1] == GGML_OP_VIEW && ops.begin()[2] == GGML_OP_ADD &&
+            ops.begin()[3] == GGML_OP_UNARY && ops.begin()[4] == GGML_OP_SCALE &&
+            unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SIGMOID) {
+        if (node_idx + 4 >= cgraph->n_nodes) {
+            return false;
+        }
+        // The VIEW of the bias weight is left out of the fused set: it computes nothing and its source is a weight the
+        // lane buffers do not flag as constant, which would fail the subgraph check for no reason.
+        const int          gate_idxs[4] = { node_idx, node_idx + 2, node_idx + 3, node_idx + 4 };
+        const enum ggml_op gate_ops[4]  = { GGML_OP_MUL, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_SCALE };
+        const int          gate_out[1]  = { node_idx + 4 };
+        const bool sub_ok = ggml_can_fuse_subgraph_ext(cgraph, gate_idxs, 4, gate_ops, gate_out, 1);
+        if (!sub_ok) {
+            return false;
+        }
+        if (ggml_get_unary_op(cgraph->nodes[node_idx+3]) != GGML_UNARY_OP_SIGMOID) {
+            return false;
+        }
+        if (cgraph->nodes[node_idx+2]->src[1] != cgraph->nodes[node_idx+1]) {
+            return false;
+        }
+        if (!ggml_cuda_should_fuse_mul_add_sigmoid_scale(cgraph->nodes[node_idx], cgraph->nodes[node_idx+2],
+                                                         cgraph->nodes[node_idx+3], cgraph->nodes[node_idx+4])) {
+            return false;
+        }
+        int out_nodes[] = { node_idx + 4 };
+        return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int) ops.size(), out_nodes, 1);
+    }
+
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
     }
@@ -4484,6 +4514,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 
         return true;
     }
+
 
     return false;
 }
@@ -5306,6 +5337,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE }, { GGML_UNARY_OP_TANH })) {
         ggml_cuda_op_softcap(*cuda_ctx, cgraph->nodes[i + 2], node);
         return 2;
+    }
+
+    // The DeepSeek-V4 hyper-connection gates: sigmoid(x * s + b) * scale + bias, four elementwise launches per gate, four gates per layer.
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_SCALE }, { GGML_UNARY_OP_SIGMOID })) {
+        ggml_cuda_op_mul_add_sigmoid_scale(*cuda_ctx, node, cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
+        return 4;
     }
 
     return 0;
@@ -7139,6 +7176,16 @@ static ggml_backend_t ggml_backend_cuda_init_impl(int device, bool copy_only) {
         /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), device),
         /* .context = */ ctx,
     };
+
+    // The BLAS handle and its library state take device memory on first use, which is after the compute buffers were sized.
+    // Creating it here lets the reserve see that memory, so a layout that leaves no room for it fails at reserve instead of at the first prompt.
+    static const bool eager_blas_handle = [] {
+        const char * s = getenv("GGML_CUDA_EAGER_BLAS_HANDLE");
+        return s == nullptr || atoi(s) != 0;
+    }();
+    if (eager_blas_handle && !copy_only) {
+        ctx->cublas_handle();
+    }
 
     return cuda_backend;
 }
