@@ -378,6 +378,17 @@ gpt-oss-120b MXFP4          -tps 2, 4 GPUs                    16297 -> 16273 MiB
 
 The saving is the mirrored mass, so models whose large matrices are all split (gpt-oss, Gemma 4, dense Qwen) change by a few MiB, and layer mode and single-stage splits are untouched.
 
+## Tied output heads under tensor parallelism
+
+A model whose output head is tied to its token embedding (the gemma-4 family among
+others) loads the head as a duplicate of `token_embd.weight` and the duplicate keeps
+that name. The tensor split rules go by name, so the head used to fall to the mirrored
+default together with the embedding table. Every lane then ran the whole head each
+token. The duplicate is only ever read by a matrix multiply, so it now takes the same
+vocabulary split as an untied `output.weight`. gemma-4-26B-A4B-Q8 on four MI50 at
+`-tps 4`: generation 104 to 117 t/s, prefill unchanged, 561 MiB less per card, output
+identical. Layer and single-device runs never mirrored the head and are unchanged.
+
 ## gfx906 kernel tuning
 
 Hardware-specific tuning for gfx906 / VEGA20 (MI50, MI60, Radeon VII, Radeon Pro
