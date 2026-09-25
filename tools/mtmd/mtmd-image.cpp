@@ -294,8 +294,8 @@ private:
             support = filter_support * filterscale;  // Widen filter when downsampling
             ksize = static_cast<int>(std::ceil(support)) * 2 + 1;  // Total pixels in kernel
 
-            std::vector<double> pre_weights(outSize * ksize);  // Temporary weights
-            bounds.resize(outSize * 2);
+            std::vector<double> pre_weights((size_t) outSize * ksize);  // Temporary weights
+            bounds.resize((size_t) outSize * 2);
 
 
             // For each output pixel, compute its filter coefficients
@@ -322,20 +322,20 @@ private:
                 for (x = 0; x < xmax; x++) {
                     // Distance from input pixel center to output pixel center in input space
                     double w = resample_filter((x + xmin - center + 0.5) * ss);
-                    pre_weights[xx * ksize + x] = w;
+                    pre_weights[(size_t) xx * ksize + x] = w;
                     ww += w;  // Accumulate for normalization
                 }
 
                 // Normalize weights to sum to 1.0 (preserves brightness)
                 for (x = 0; x < xmax; x++) {
                     if (ww != 0.0) {
-                        pre_weights[xx * ksize + x] /= ww;
+                        pre_weights[(size_t) xx * ksize + x] /= ww;
                     }
                 }
 
                 // Zero-pad remaining kernel positions
                 for (; x < ksize; x++) {
-                    pre_weights[xx * ksize + x] = 0;
+                    pre_weights[(size_t) xx * ksize + x] = 0;
                 }
 
                 // Store input pixel range for this output pixel
@@ -345,11 +345,11 @@ private:
 
             // Convert floating-point coefficients to fixed-point integers
             // Formula: int32 = round(float * 2^PRECISION_BITS)
-            weights.resize(outSize * ksize);
+            weights.resize((size_t) outSize * ksize);
 
             const double fxp_scale = std::ldexp(1.0, PRECISION_BITS); // 1.0 * 2^PRECISION_BITS
 
-            for (int i = 0; i < outSize * ksize; i++) {
+            for (size_t i = 0; i < (size_t) outSize * ksize; i++) {
                 // Pillow adds +/- 0.5 then truncates toward zero; std::round would round twice
                 const double rounded = pre_weights[i] * fxp_scale + (pre_weights[i] < 0 ? -0.5 : 0.5);
                 weights[i] = static_cast<int32_t>(rounded);
@@ -441,6 +441,12 @@ private:
         // Main resampling logic using separable two-pass approach
         const int src_width  = img.get_size().width;
         const int src_height = img.get_size().height;
+
+        // sanity check on the target size
+        if (target_width <= 0 || target_width > 65536 || target_height <= 0 || target_height > 65536) {
+            throw std::runtime_error("resize target " + std::to_string(target_width) + "x" +
+                                     std::to_string(target_height) + " is out of range (max 65536)");
+        }
 
         bool need_horizontal = (target_width != src_width);
         bool need_vertical = (target_height != src_height);
@@ -980,6 +986,56 @@ mtmd_image_preproc_out mtmd_image_preprocessor_idefics3::preprocess(const clip_i
     //
     // CITE: https://github.com/huggingface/transformers/blob/main/src/transformers/models/idefics3/image_processing_idefics3.py#L737
     const clip_image_size original_size = img.get_size();
+
+    // old gguf files have no preprocessor longest size, custom token limits also need the generic size below
+    if (hparams.image_longest_edge > 0 && hparams.image_min_pixels <= 0 && hparams.image_max_pixels <= 0) {
+        const int    tile_size    = hparams.image_size;
+        const int    longest_edge = hparams.image_longest_edge;
+        const double aspect_ratio = (double) original_size.width / original_size.height;
+
+        clip_image_size resized_size;
+        if (original_size.width >= original_size.height) {
+            resized_size.width   = longest_edge;
+            resized_size.height  = (int) (longest_edge / aspect_ratio);
+            resized_size.height += resized_size.height % 2;
+        } else {
+            resized_size.height  = longest_edge;
+            resized_size.width   = (int) (longest_edge * aspect_ratio);
+            resized_size.width  += resized_size.width % 2;
+        }
+
+        const int grid_x = (resized_size.width  + tile_size - 1) / tile_size;
+        const int grid_y = (resized_size.height + tile_size - 1) / tile_size;
+        const clip_image_size refined_size = clip_image_size{grid_x * tile_size, grid_y * tile_size};
+
+        clip_image_u8 resized_img;
+        img_tool::resize(img, resized_img, resized_size, hparams.image_resize_algo, PAD_NONE);
+
+        clip_image_u8 refined_img;
+        img_tool::resize(resized_img, refined_img, refined_size, hparams.image_resize_algo, PAD_NONE);
+
+        clip_image_u8 overview;
+        img_tool::resize(refined_img, overview, {tile_size, tile_size}, hparams.image_resize_algo, PAD_NONE);
+
+        std::vector<clip_image_u8> slices;
+        for (int y = 0; y < grid_y; y++) {
+            for (int x = 0; x < grid_x; x++) {
+                clip_image_u8 slice;
+                img_tool::crop(refined_img, slice, x * tile_size, y * tile_size, tile_size, tile_size);
+                slices.push_back(std::move(slice));
+            }
+        }
+
+        LOG_DBG("%s: grid size: %d x %d (%d tiles) + overview\n", __func__, grid_x, grid_y, grid_x * grid_y);
+
+        mtmd_image_preproc_out output;
+        output.append_overview(hparams, overview, true);
+        output.append(hparams, slices, true);
+        output.grid_x = grid_x;
+        output.grid_y = grid_y;
+        return output;
+    }
+
     const clip_image_size refined_size = img_tool::calc_size_preserved_ratio(
         original_size,
         { hparams.image_size, std::max(0, hparams.image_min_pixels), std::max(0, hparams.image_max_pixels), hparams.image_longest_edge });

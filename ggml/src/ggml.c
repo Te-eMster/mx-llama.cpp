@@ -1,6 +1,7 @@
 #define _CRT_SECURE_NO_DEPRECATE // Disables "unsafe" warnings on Windows
 #define _USE_MATH_DEFINES // For M_PI on MSVC
 
+#include "ggml-version.h"
 #include "ggml-backend.h"
 #include "ggml-impl.h"
 #include "ggml-threading.h"
@@ -3276,6 +3277,57 @@ struct ggml_tensor * ggml_l2_norm_inplace(
     return ggml_l2_norm_impl(ctx, a, eps, true);
 }
 
+// ggml_prec
+
+bool ggml_prec_set_acc(
+        struct ggml_tensor * a,
+        enum ggml_prec       prec) {
+    switch (a->op) {
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_ID:
+            {
+                const int32_t prec_i32 = (int32_t) prec;
+                ggml_set_op_params_i32(a, 0, prec_i32);
+            }
+            break;
+        case GGML_OP_FLASH_ATTN_EXT:
+            {
+                const int32_t prec_i32 = (int32_t) prec;
+                ggml_set_op_params_i32(a, 3, prec_i32);
+            }
+            break;
+        default:
+            return false;
+    };
+
+    return true;
+}
+
+bool ggml_prec_set_src(
+        struct ggml_tensor * a,
+        enum ggml_prec       prec,
+        int                  idx) {
+    GGML_ASSERT(idx >= 0 && idx < GGML_MAX_SRC);
+
+    switch (a->op) {
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_ID:
+            {
+                if (idx != 1) {
+                    return false;
+                }
+
+                const int32_t prec_i32 = (int32_t) prec;
+                ggml_set_op_params_i32(a, 2 + idx, prec_i32);
+            }
+            break;
+        default:
+            return false;
+    };
+
+    return true;
+}
+
 // ggml_mul_mat
 
 static inline bool ggml_can_mul_mat(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {
@@ -3845,8 +3897,8 @@ struct ggml_tensor * ggml_permute(
     struct ggml_tensor * result = ggml_view_tensor(ctx, a);
     ggml_format_name(result, "%s (permuted)", a->name);
 
-    int ne[GGML_MAX_DIMS];
-    int nb[GGML_MAX_DIMS];
+    int64_t ne[GGML_MAX_DIMS];
+    size_t nb[GGML_MAX_DIMS];
 
     ne[axis0] = a->ne[0];
     ne[axis1] = a->ne[1];
@@ -7363,7 +7415,7 @@ void ggml_build_backward_expand(
         }
 
         // inplace operations are currently not supported
-        GGML_ASSERT(!node->view_src || node->op == GGML_OP_CPY || node->op == GGML_OP_VIEW ||
+        GGML_ASSERT(!node->view_src || node->op == GGML_OP_CPY || node->op == GGML_OP_SET_ROWS || node->op == GGML_OP_VIEW ||
             node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE);
 
         const size_t ihash = ggml_hash_find(&cgraph->visited_hash_set, node);
@@ -7398,7 +7450,7 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
 
 static size_t ggml_graph_nbytes(size_t size, bool grads) {
     size_t hash_size = ggml_hash_size(size * 2);
-    void * p = 0;
+    void * p = (char *) 1024; // workaround for ubsan error "applying non-zero offset X to null pointer"
     incr_ptr_aligned(&p, sizeof(struct ggml_cgraph), 1);
     incr_ptr_aligned(&p, size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)); // nodes
     incr_ptr_aligned(&p, size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)); // leafs
@@ -7411,7 +7463,7 @@ static size_t ggml_graph_nbytes(size_t size, bool grads) {
     incr_ptr_aligned(&p, ggml_bitset_size(hash_size) * sizeof(ggml_bitset_t), sizeof(ggml_bitset_t));
 
     size_t nbytes = (size_t) p;
-    return nbytes;
+    return nbytes - 1024;
 }
 
 size_t ggml_graph_overhead_custom(size_t size, bool grads) {
