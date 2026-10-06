@@ -29,7 +29,7 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,       hparams.n_lora_q);
     ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,    hparams.n_swa);
 
-    ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,  hparams.n_ff_exp);
+    ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all);
     ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,         hparams.n_expert_shared);
     ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,        hparams.expert_weights_scale);
     ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,         hparams.expert_weights_norm);
@@ -69,6 +69,7 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
     // tokens of an image span attend bidirectionally to the whole span, the window only applies to older tokens
     // ref: get_window_topk_idxs_visible in the reference impl
     hparams.swa_full_non_causal = true;
+    hparams.non_causal_type = LLAMA_NON_CAUSAL_TYPE_SWA_FULL;
     for (uint32_t il = hparams.n_layer(); il < hparams.n_layer_all; ++il) {
         hparams.is_swa_impl[il] = true;
     }
@@ -83,7 +84,7 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
     const int64_t q_lora_rank     = hparams.n_lora_q;
-    const int64_t n_ff_exp        = hparams.n_ff_exp;
+    const int64_t n_ff_exp        = hparams.n_ff_exp();
     const int64_t n_expert_shared = hparams.n_expert_shared;
 
     const int64_t n_embd_head = hparams.n_embd_head_k();
@@ -264,15 +265,14 @@ static dsv4_state_tensors dsv4_build_state_snapshot(
 }
 
 
-// mean over the hyper-connection streams: [n_embd, hc, n_tokens] -> [n_embd, n_tokens]
-static ggml_tensor * dsv4_hc_mean(ggml_context * ctx, ggml_tensor * x) {
+ggml_tensor * llama_model_deepseek4::graph::build_hc_mean(ggml_tensor * x) const {
     const int64_t hc = x->ne[1];
 
-    ggml_tensor * acc = ggml_view_2d(ctx, x, x->ne[0], x->ne[2], x->nb[2], 0);
+    ggml_tensor * acc = ggml_view_2d(ctx0, x, x->ne[0], x->ne[2], x->nb[2], 0);
     for (int64_t s = 1; s < hc; ++s) {
-        acc = ggml_add(ctx, acc, ggml_view_2d(ctx, x, x->ne[0], x->ne[2], x->nb[2], s*x->nb[1]));
+        acc = ggml_add(ctx0, acc, ggml_view_2d(ctx0, x, x->ne[0], x->ne[2], x->nb[2], s*x->nb[1]));
     }
-    return ggml_scale(ctx, acc, 1.0f/hc);
+    return ggml_scale(ctx0, acc, 1.0f/hc);
 }
 
 static ggml_tensor * dsv4_hc_affine(
@@ -1333,7 +1333,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
 
     for (int il = 0; il < n_layer; ++il) {
         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
-            res->t_layer_inp[il] = dsv4_hc_mean(ctx0, inpL);
+            res->t_layer_inp[il] = build_hc_mean(inpL);
             cb(res->t_layer_inp[il], "layer_inp", il);
             // expanded by set_outputs at the END of the build - expanding here walks
             // the dependency chain in a different DFS order than the natural build
@@ -1396,6 +1396,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         ggml_tensor * exp_probs_b = layer.ffn_exp_probs_b;
 
         // may apply exp_probs_b_vl is input is from mtmd
+        ASSERT_EMBD_OR_TOKEN(ubatch);
         const bool is_media = ubatch.embd != nullptr;
         if (is_media) {
             if (layer.ffn_exp_probs_b_vl) {
@@ -1412,7 +1413,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 layer.ffn_gate_exps,
                 layer.ffn_down_exps,
                 exp_probs_b,
-                n_expert, hparams.n_expert_used,
+                n_expert, hparams.n_expert_used(),
                 LLM_FFN_SILU, hparams.expert_weights_norm,
                 hparams.expert_weights_scale,
                 (llama_expert_gating_func_type) hparams.expert_gating_func,
@@ -1441,7 +1442,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     }
 
     if ((size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer]) {
-        res->t_layer_inp[n_layer] = dsv4_hc_mean(ctx0, inpL);
+        res->t_layer_inp[n_layer] = build_hc_mean(inpL);
         cb(res->t_layer_inp[n_layer], "layer_inp", n_layer);
         // expanded by set_outputs, see the per-layer taps above
     }
@@ -1488,6 +1489,7 @@ llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm
     GGML_ASSERT(cparams.nextn_layer_offset >= 0 &&
             cparams.nextn_layer_offset < (int) hparams.n_layer_nextn &&
             "nextn_layer_offset out of range [0, n_layer_nextn)");
+    ASSERT_EMBD_OR_TOKEN(ubatch);
     GGML_ASSERT(ubatch.token && "DEEPSEEK4 MTP requires token input");
 
     const int64_t hc = hparams.dsv4_hc_mult;
@@ -1576,7 +1578,7 @@ llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm
             layer.ffn_gate_exps,
             layer.ffn_down_exps,
             layer.ffn_exp_probs_b,
-            n_expert, hparams.n_expert_used,
+            n_expert, hparams.n_expert_used(),
             LLM_FFN_SILU, hparams.expert_weights_norm,
             hparams.expert_weights_scale,
             (llama_expert_gating_func_type) hparams.expert_gating_func,

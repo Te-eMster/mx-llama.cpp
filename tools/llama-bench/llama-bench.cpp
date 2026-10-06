@@ -431,6 +431,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("\n");
     printf("options:\n");
     printf("  -h, --help\n");
+    printf("  --version                                   show version and build info\n");
     printf("  --numa <distribute|isolate|numactl>         numa mode (default: disabled)\n");
     printf("  -r, --repetitions <n>                       number of times to repeat each test (default: %d)\n", cmd_params_defaults.reps);
     printf("  --prio <-1|0|1|2|3>                         process/thread priority (default: %d)\n", cmd_params_defaults.prio);
@@ -481,8 +482,6 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -dev, --device <dev0/dev1/...>                    (default: auto)\n");
     printf("  -lm, --load-mode <auto|none|mmap|mlock|mmap+mlock|dio> (default: %s)\n", join(transform_to_str(cmd_params_defaults.load_mode, llama_load_mode_name), ",").c_str());
     printf("  -lzm, --lazy-mode <on|auto|off>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.lazy_mode, lazy_mode_str), ",").c_str());
-    printf("  -mmp, --mmap <0|1>                                (DEPRECATED IN FAVOUR OF --load-mode)\n");
-    printf("  -dio, --direct-io <0|1>                           (DEPRECATED IN FAVOUR OF --load-mode)\n");
     printf("  -embd, --embeddings <0|1>                         (default: %s)\n", join(cmd_params_defaults.embeddings, ",").c_str());
     printf("  -ts, --tensor-split <ts0/ts1/..>                  (default: 0)\n");
     printf("  -ot --override-tensor <tensor name pattern>=<buffer type>;...\n");
@@ -557,6 +556,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
         try {
             if (arg == "-h" || arg == "--help") {
                 print_usage(argc, argv);
+                exit(0);
+            } else if (arg == "--version") {
+                llama_print_build_info(llama_version());
                 exit(0);
             } else if (arg == "-m" || arg == "--model") {
                 if (++i >= argc) {
@@ -905,44 +907,6 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 params.flash_attn.insert(params.flash_attn.end(), types.begin(), types.end());
-            } else if (arg == "-mmp" || arg == "--mmap") {
-                if (++i >= argc) {
-                    invalid_param = true;
-                    break;
-                }
-                LOG_WRN("DEPRECATED: -mmp and --mmap are deprecated in favour of --load-mode. Please use --load-mode mmap instead.\n");
-                auto p = string_split<bool>(argv[i], split_delim);
-
-                std::vector<llama_load_mode> modes;
-                for (const auto & m : p) {
-                    llama_load_mode mode;
-                    if (m) {
-                        mode = LLAMA_LOAD_MODE_MMAP;
-                    } else {
-                        mode = LLAMA_LOAD_MODE_NONE;
-                    }
-                    modes.push_back(mode);
-                }
-                params.load_mode.insert(params.load_mode.end(), modes.begin(), modes.end());
-            } else if (arg == "-dio" || arg == "--direct-io") {
-                if (++i >= argc) {
-                    invalid_param = true;
-                    break;
-                }
-                LOG_WRN("DEPRECATED: -dio and --direct-io are deprecated in favour of --load-mode. Please use --load-mode dio instead.\n");
-                auto p = string_split<bool>(argv[i], split_delim);
-
-                std::vector<llama_load_mode> modes;
-                for (const auto & m : p) {
-                    llama_load_mode mode;
-                    if (m) {
-                        mode = LLAMA_LOAD_MODE_DIRECT_IO;
-                    } else {
-                        mode = LLAMA_LOAD_MODE_NONE;
-                    }
-                    modes.push_back(mode);
-                }
-                params.load_mode.insert(params.load_mode.end(), modes.begin(), modes.end());
             } else if (arg == "-embd" || arg == "--embeddings") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1152,7 +1116,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
             p.hf_token      = params.hf_token;
             p.offline       = params.offline;
             p.model.hf_repo = params.hf_repo[i];
-            if (!params.hf_file.empty() && !params.hf_file[i].empty()) {
+            if (i < params.hf_file.size() && !params.hf_file[i].empty()) {
                 p.model.hf_file = params.hf_file[i];
             }
 
@@ -2261,7 +2225,8 @@ static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_th
         for (int i = 1; i < n_tokens; i++) {
             tokens[i] = std::rand() % n_vocab;
         }
-        int res = llama_decode(ctx, llama_batch_get_one(tokens.data(), n_tokens));
+        common_batch batch = common_batch_get_one(ctx, tokens.data(), n_tokens);
+        int res = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
         if (res != 0) {
             fprintf(stderr, "%s: failed to decode prompt batch, res = %d\n", __func__, res);
             return false;
@@ -2282,8 +2247,13 @@ static bool test_gen(llama_context * ctx, int n_gen, int n_threads) {
 
     llama_token token = llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : std::rand() % n_vocab;
 
+    common_batch batch(ctx);
+    llama_pos pos = llama_memory_seq_pos_max(llama_get_memory(ctx), 0) + 1;
+
     for (int i = 0; i < n_gen; i++) {
-        int res = llama_decode(ctx, llama_batch_get_one(&token, 1));
+        batch.clear();
+        batch.add(token, pos++, 0, true);
+        int res = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
         if (res != 0) {
             fprintf(stderr, "%s: failed to decode generation batch, res = %d\n", __func__, res);
             return false;
@@ -2295,8 +2265,10 @@ static bool test_gen(llama_context * ctx, int n_gen, int n_threads) {
 }
 
 static void llama_null_log_callback(enum ggml_log_level level, const char * text, void * user_data) {
-    (void) level;
-    (void) text;
+    if (level == GGML_LOG_LEVEL_ERROR) {
+        fprintf(stderr, "%s", text);
+        return;
+    }
     (void) user_data;
 }
 
