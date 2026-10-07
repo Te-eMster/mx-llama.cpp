@@ -1555,6 +1555,15 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
     }
 }
 
+static const char * ggml_backend_buffer_usage_name(enum ggml_backend_buffer_usage usage) {
+    switch (usage) {
+        case GGML_BACKEND_BUFFER_USAGE_ANY:     return "any";
+        case GGML_BACKEND_BUFFER_USAGE_WEIGHTS: return "weights";
+        case GGML_BACKEND_BUFFER_USAGE_COMPUTE: return "compute";
+    }
+    return "unknown";
+}
+
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     // reset splits
@@ -1872,9 +1881,14 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         return e == NULL || atoi(e) != 0;
                     }();
                     struct ggml_tensor * root = src->view_src;
+                    // share only canonical-layout activation views: weights may be filled selectively (MoE expert copy)
+                    // and repack buffers interleave bytes per shape, so span equality is not byte equality there
                     const bool share_root = share_view_inputs && root != NULL && tensor_id_copy(src_id, cur_backend_id, 0) == NULL &&
                         src->view_offs == 0 && ggml_nbytes(src) == ggml_nbytes(root) && ggml_is_contiguous(src) && ggml_is_contiguous(root) &&
-                        !(root->flags & GGML_TENSOR_FLAG_INPUT) && sched->hv_tensor_backend_ids[hash_id(root)] == src_backend_id &&
+                        !(root->flags & GGML_TENSOR_FLAG_INPUT) && !(src->flags & GGML_TENSOR_FLAG_INPUT) &&
+                        ggml_blck_size(root->type) == 1 && ggml_blck_size(src->type) == 1 &&
+                        (root->buffer == NULL || ggml_backend_buffer_get_usage(root->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) &&
+                        sched->hv_tensor_backend_ids[hash_id(root)] == src_backend_id &&
                         !ggml_backend_sched_buffer_supported(sched, root, cur_backend_id);
                     if (share_root) {
                         const size_t root_id = hash_id(root);
@@ -1902,6 +1916,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                             ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
                             tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
                             SET_CAUSE(tensor_copy, "4.cpy");
+                        }
+                        if (sched->debug) {
+                            GGML_LOG_DEBUG("%s: share view %s (%s) of %s (%s, usage=%s) backends %d -> %d\n", __func__,
+                                src->name, ggml_type_name(src->type), root->name, ggml_type_name(root->type),
+                                root->buffer ? ggml_backend_buffer_usage_name(ggml_backend_buffer_get_usage(root->buffer)) : "none",
+                                src_backend_id, cur_backend_id);
                         }
                     }
                     // create a copy of the input in the split's backend
@@ -2409,12 +2429,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 if (split->graph.n_nodes > 0 &&
                     ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
                     ggml_backend_buffer_is_host(input->buffer) && (
-                    (node->src[0] == input_cpy && node->op == GGML_OP_MUL_MAT_ID)
+                    ((node->src[0] == input_cpy || (node->src[0] != NULL && node->src[0]->view_src == input_cpy)) && node->op == GGML_OP_MUL_MAT_ID)
                     //|| (node->src[1] == input_cpy && node->op == GGML_OP_ADD_ID) /* GGML_OP_ADD_ID weights are small and not worth splitting */
                     )) {
 
-                    const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
-                    const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
+                    // derive the expert layout from the tensor the node consumes, which may be a view of the copy
+                    const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? node->src[0]->ne[2] : node->src[0]->ne[1];
+                    const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? node->src[0]->nb[2] : node->src[0]->nb[1];
 
                     t0 = ggml_backend_sched_timing_now(sched);
                     ggml_backend_synchronize(input_backend);
@@ -2461,7 +2482,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                     // group consecutive experts and copy them together
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
-                        const size_t expert_offset = first_id * expert_size;
+                        const size_t expert_offset = node->src[0]->view_offs + first_id * expert_size;
                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
                         const size_t padding = std::min<size_t>(expert_size, 512);
                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
@@ -2499,6 +2520,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         last_id = id;
                     }
                     copy_experts(first_id, last_id);
+
+                    if (sched->debug) {
+                        GGML_LOG_DEBUG("%s: moe expert copy %s expert_size=%zu experts=%d..%d\n", __func__,
+                            input->name, expert_size, first_id, last_id);
+                    }
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface

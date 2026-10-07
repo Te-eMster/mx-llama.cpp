@@ -462,6 +462,7 @@ struct hash_node {
     int buffer_id;
     struct buffer_address addr;
     bool allocated;
+    bool counted_view; // view registered in its view_src->n_views by the graph count
 };
 
 struct tensor_alloc {
@@ -867,6 +868,7 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
         if (ggml_impl_is_view(node) && node->op != GGML_OP_NONE) {
             struct ggml_tensor * view_src = node->view_src;
             ggml_gallocr_hash_get(galloc, view_src)->n_views += 1;
+            ggml_gallocr_hash_get(galloc, node)->counted_view = true;
         }
 
         if (node->flags & GGML_TENSOR_FLAG_INPUT) {
@@ -932,13 +934,16 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
 
             if (p_hn->n_children == 0 && p_hn->n_views == 0) {
                 if (ggml_impl_is_view(parent)) {
-                    struct ggml_tensor * view_src = parent->view_src;
-                    struct hash_node * view_src_hn = ggml_gallocr_hash_get(galloc, view_src);
-                    view_src_hn->n_views -= 1;
-                    AT_PRINTF("view_src %s: %d children, %d views\n",
-                        view_src->name, view_src_hn->n_children, view_src_hn->n_views);
-                    if (view_src_hn->n_views == 0 && view_src_hn->n_children == 0 && view_src_hn->allocated) {
-                        ggml_gallocr_free_node(galloc, view_src);
+                    // release the n_views ref only for views counted above; uncounted views (scheduler-shared input views) never took one
+                    if (p_hn->counted_view) {
+                        struct ggml_tensor * view_src = parent->view_src;
+                        struct hash_node * view_src_hn = ggml_gallocr_hash_get(galloc, view_src);
+                        view_src_hn->n_views -= 1;
+                        AT_PRINTF("view_src %s: %d children, %d views\n",
+                            view_src->name, view_src_hn->n_children, view_src_hn->n_views);
+                        if (view_src_hn->n_views == 0 && view_src_hn->n_children == 0 && view_src_hn->allocated) {
+                            ggml_gallocr_free_node(galloc, view_src);
+                        }
                     }
                 }
                 else if (p_hn->allocated) {
