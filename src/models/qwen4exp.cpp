@@ -200,17 +200,12 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     // tensor unique to each group rather than trusting the block count, and mark the
     // absent group optional - a head-only file legitimately has no trunk and vice
     // versa. n_layer covers the MTP block, so the trunk ends n_layer_nextn short.
-    const int64_t n_mtp   = hparams.n_layer_nextn;
     const int64_t n_trunk = n_layer;                 // n_layer() already excludes them
     const int64_t n_blocks = hparams.n_layer_all;    // trunk plus MTP
 
-    const bool mtp_only = n_mtp > 0 && ml.get_weight("blk.0.attn_q.weight") == nullptr;
-    const std::string mtp_probe = "blk." + std::to_string(n_trunk) + ".nextn.eh_proj.weight";
-    const bool trunk_only = n_mtp > 0 && ml.get_weight(mtp_probe.c_str()) == nullptr;
-
-    const int trunk_flags = mtp_only   ? TENSOR_NOT_REQUIRED : 0;
-    int mtp_flags   = trunk_only ? TENSOR_NOT_REQUIRED : 0;
-    if (!ml.load_mtp) { mtp_flags |= TENSOR_SKIP; }
+    const auto nf = nextn_flags(ml, LLM_TENSOR_HC_ATTN_NORM);
+    const int trunk_flags = nf.trunk;
+    const int mtp_flags   = nf.mtp;
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
 
@@ -606,8 +601,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         // on n_layer would leave inp_out_ids unused, and so unallocated, for MTP
         // when unmasked nextn embeddings are requested the tap must keep ALL rows, so
         // the early masking is skipped here and applied after the tap instead
-        if (il == il_end - 1 && inp_out_ids &&
-                (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked)) {
+        if (il == il_end - 1 && crop_before_nextn(inp_out_ids)) {
             // everything below is per token, so drop the rows that produce no output
             cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
             inject = ggml_get_rows(ctx0, inject, inp_out_ids);
@@ -653,7 +647,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     // the masking deferred above, now that the tap has its full-width rows. get_rows
     // gathers along dim 1, which on the 3D residual is the stream axis - so flatten to
     // [n_embd*hc, nt] first and restore the shape after, as the in-loop path does.
-    if (cparams.embeddings_nextn && !cparams.embeddings_nextn_masked && inp_out_ids) {
+    if (crop_after_nextn(inp_out_ids)) {
         res_hc = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
         res_hc = ggml_get_rows(ctx0, res_hc, inp_out_ids);
         res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
@@ -716,7 +710,7 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
-        mctx->set_input_kpool(pool_cells, pool_idxs, pool_mask, tail_idxs, nullptr, false, new_pool_idxs, new_pool_rep,
+        mctx->set_input_kpool(pool_cells, pool_idxs, pool_mask, tail_idxs, nullptr, new_pool_idxs, new_pool_rep,
                               ubatch, new_pool_pos);
     }
 
@@ -789,8 +783,7 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
 
     inp->new_pool_idxs = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, inp->n_new);
     ggml_set_input(inp->new_pool_idxs);
-    // the scatter target is part of the graph shape: llama_context reserves the full-context graph,
-    // so this must not depend on cache_safe, which only the decode-time graph can know
+    // one scatter row per new pool, each a distinct rep row (see kpool_build_state)
     inp->new_pool_rep = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, inp->n_new);
     ggml_set_input(inp->new_pool_rep);
     inp->new_pool_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*inp->n_new);
@@ -850,9 +843,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     pooled_new = ggml_reshape_2d(ctx0, pooled_new, idx_dim, n_new);
     cb(pooled_new, "indexer_pool_k_new", il);
 
-    // scatter the fresh pooled keys, then gather all n_pool of them by cell, in both cache modes:
-    // the reserved graph cannot branch on cache_safe, and without sharing every pool is re-pooled
-    // anyway (n_new == n_pool_real, layout order), so the gather returns exactly pooled_new
+    // scatter the fresh pooled keys into their rep rows, then gather all n_pool of them by cell:
+    // the older pools come from the rows earlier ubatches wrote
     ggml_build_forward_expand(gf, kpool_cache.scatter_pooled(pooled_new, inp_kpool->new_pool_rep));
     ggml_tensor * pooled = kpool_cache.gather_pooled(inp_kpool->pool_cells);
     pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_pool);

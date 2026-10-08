@@ -1033,6 +1033,9 @@ struct ggml_backend_sched {
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
 
+    ggml_backend_sched_copy_callback callback_copy;
+    void * callback_copy_user_data;
+
     char * context_buffer;
     size_t context_buffer_size;
 
@@ -2284,6 +2287,54 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+static bool ggml_backend_sched_is_host_weight(const struct ggml_tensor * t) {
+    return t->buffer != NULL &&
+        ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+        ggml_backend_buffer_is_host(t->buffer);
+}
+
+static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input) {
+    const int split_backend_id = split->backend_id;
+    ggml_backend_t split_backend = sched->backends[split_backend_id];
+    ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
+    struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+
+    if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+        // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+            ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+        } else {
+            ggml_backend_synchronize(split_backend);
+        }
+        ggml_backend_tensor_copy(input, input_cpy);
+        return;
+    }
+
+    // wait for the split backend to finish using the input before overwriting it
+    if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+        ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+    } else {
+        ggml_backend_synchronize(split_backend);
+    }
+
+    if (sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input) &&
+        sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
+        return;
+    }
+
+    // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
+    // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
+    if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+        ggml_backend_synchronize(input_backend);
+        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+            ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+        } else {
+            ggml_backend_synchronize(split_backend);
+        }
+        ggml_backend_tensor_copy(input, input_cpy);
+    }
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -2583,7 +2634,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             }
                             sched->timing.us_non_graph_input_fallback_wait += ggml_backend_sched_timing_dt(sched, t0);
                             t0 = ggml_backend_sched_timing_now(sched);
-                            ggml_backend_tensor_copy(input, input_cpy);
+                            // last resort: route through the helper so callback_copy can still handle host weights
+                            if (sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input)) {
+                                ggml_backend_sched_copy_input(sched, split, input);
+                            } else {
+                                ggml_backend_tensor_copy(input, input_cpy);
+                            }
                             sched->timing.us_non_graph_input_fallback_copy += ggml_backend_sched_timing_dt(sched, t0);
                             ggml_backend_sched_timing_trace_input(sched, "non_graph_fallback", input, input_cpy, input_backend, split_backend);
                         }
@@ -2876,6 +2932,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
 void ggml_backend_sched_set_sync_non_graph_inputs(ggml_backend_sched_t sched, bool enabled) {
     GGML_ASSERT(sched);
     sched->sync_non_graph_inputs = enabled;
+}
+
+void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_copy = callback;
+    sched->callback_copy_user_data = user_data;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

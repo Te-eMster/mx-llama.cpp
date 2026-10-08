@@ -726,6 +726,7 @@ void llama_context::sched_reserve() {
             sync_non_graph_inputs = atoi(value) != 0;
         }
         ggml_backend_sched_set_sync_non_graph_inputs(result, sync_non_graph_inputs);
+        ggml_backend_sched_set_copy_callback(result, sched_copy_experts, this);
         return result;
     };
 
@@ -3258,6 +3259,7 @@ ggml_status llama_context::graph_compute(
         ggml_backend_event_wait(wait.first, wait.second);
     }
     tap_readback_waits.clear();
+    copy_experts.reset();
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
@@ -3267,6 +3269,65 @@ ggml_status llama_context::graph_compute(
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 
     return status;
+}
+
+bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
+    auto & st = static_cast<llama_context *>(user_data)->copy_experts;
+
+    // the ids must be computed before the split starts, so only the first node of the split is considered
+    if (ggml_graph_n_nodes(graph) == 0) {
+        return false;
+    }
+    const ggml_tensor * node = ggml_graph_node(graph, 0);
+    if (node->op != GGML_OP_MUL_MAT_ID || node->src[0] != dst) {
+        return false;
+    }
+
+    const ggml_tensor * ids = node->src[2];
+    if (ggml_nelements(ids) == 0) {
+        return true;
+    }
+
+    const int64_t n_expert    = src->ne[2];
+    const size_t  expert_size = src->nb[2];
+
+    if (ids != st.ids || (int64_t) st.used.size() != n_expert) {
+        st.ids_data.resize(ggml_nbytes(ids)/sizeof(int32_t));
+        ggml_backend_tensor_get_async(backend, ids, st.ids_data.data(), 0, ggml_nbytes(ids));
+        ggml_backend_synchronize(backend);
+
+        st.used.assign(n_expert, false);
+        for (int64_t i1 = 0; i1 < ids->ne[1]; i1++) {
+            for (int64_t i0 = 0; i0 < ids->ne[0]; i0++) {
+                const int32_t id = st.ids_data[i1*ids->nb[1]/sizeof(int32_t) + i0*ids->nb[0]/sizeof(int32_t)];
+                GGML_ASSERT(id >= 0 && id < n_expert);
+                st.used[id] = true;
+            }
+        }
+
+        st.ids = ids;
+    }
+
+    // group consecutive experts and copy them together
+    for (int64_t first = 0; first < n_expert; ) {
+        if (!st.used[first]) {
+            first++;
+            continue;
+        }
+        int64_t last = first;
+        while (last + 1 < n_expert && st.used[last + 1]) {
+            last++;
+        }
+
+        // copy a bit extra to ensure there are no NaNs in the padding of the last expert, this is necessary for MMQ in the CUDA backend
+        const size_t offset  = first*expert_size;
+        const size_t padding = last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
+        ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, (last - first + 1)*expert_size + padding);
+
+        first = last + 1;
+    }
+
+    return true;
 }
 
 llm_graph_cb llama_context::graph_get_cb() const {
@@ -4325,6 +4386,7 @@ void llama_context::opt_epoch_iter(
                     ggml_backend_tensor_set(labels, &onef, (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
                 }
             }
+            copy_experts.reset();
             ggml_opt_eval(opt_ctx, result);
             if (callback) {
                 callback(train, opt_ctx, dataset, result, idata_in_loop + (pos_ctx + pos_batch)/n_ubatch + 1, ndata_in_loop, t_loop_start);
