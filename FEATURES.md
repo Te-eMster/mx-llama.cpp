@@ -335,6 +335,26 @@ byte-identical in every arm:
   -sm tensor -tps 4  prefill 167.0 -> 282.8 t/s  (+69%, staging)
   -sm layer          prefill 426.9 -> 585.4 t/s  (+37%, ring depth)
 
+## View-sharing scheduler input staging
+
+A graph input that is a full-size view of another tensor (a reshape of a layer
+output) was staged across the backend boundary as its own copy, so the same
+bytes crossed twice, once for the source and once for the view. It is now
+staged as a view of its source's copy instead, so the two cross once. On by
+default; `GGML_SCHED_SHARE_VIEW_INPUTS=0` restores one copy per input.
+Backend-generic, inert when a graph runs on a single backend.
+
+Shared views are only created for full-span, offset-0, contiguous,
+canonical-layout activation views: neither the view nor its root carries
+`GGML_TENSOR_FLAG_INPUT`, both are `ggml_blck_size == 1` types, and the root's
+buffer is not `GGML_BACKEND_BUFFER_USAGE_WEIGHTS`. Weights may be filled
+selectively by the MoE expert copy, and repack buffers interleave bytes per
+shape, so span equality is not byte equality there.
+
+`GGML_SCHED_DEBUG=1` logs each share event and each MoE expert copy, at no cost
+when the flag is off. The graph allocator counts only the views it registered,
+so a shared input view takes no `n_views` reference on its root.
+
 ## Multi-GPU transfer tuning
 
 Hardware-queue handling (`GPU_MAX_HW_QUEUES`) and an optional RCCL point-to-point
@@ -425,6 +445,8 @@ load stages canonical bytes and repacks on the device, so `-sm layer` loads
 at vanilla-loader parity and tensor-parallel loads within about 1.4x of it.
 Every type is admitted under `-sm tensor` and multi-stage `-tps`, where each
 lane slice repacks. VRAM use stays at the canonical size for every type.
+The repack buffer type initializes the 8-slot `ggml_backend_buffer_type_i` of
+ggml-backend API v3, so its initializer has to track upstream struct growth.
 
 | type | repacked layout | prefill vs canonical | generation vs canonical | numerics |
 |---|---|---|---|---|
