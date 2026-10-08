@@ -1900,10 +1900,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                             for (int c = 0; c < sched->n_copies; c++) {
                                 struct ggml_tensor * root_copy = ggml_dup_tensor_layout(sched->ctx, root);
                                 ggml_format_name(root_copy, "%s#%s#%d", ggml_backend_name(backend), root->name, c);
-                                if (sched->n_copies > 1) {
-                                    ggml_set_input(root_copy);
-                                    ggml_set_output(root_copy); // prevent ggml-alloc from overwriting the tensor
-                                }
+                                ggml_set_input(root_copy);
+                                ggml_set_output(root_copy); // prevent ggml-alloc from overwriting the tensor
                                 tensor_id_copy(root_id, cur_backend_id, c) = root_copy;
                                 SET_CAUSE(root_copy, "4.cpy");
                             }
@@ -2502,8 +2500,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                     // if the ids tensor is also an input of the split, it may not have been copied yet to the split backend
                     // in that case, we use the original ids tensor
+                    // shared views resolve to their original source - the copy may not be filled yet
                     for (int i = input_id + 1; i < split->n_inputs; i++) {
-                        if (ids_tensor == tensor_copy(split->inputs[i], split_backend_id, sched->cur_copy)) {
+                        ggml_tensor * cand = tensor_copy(split->inputs[i], split_backend_id, sched->cur_copy);
+                        if (ids_tensor == cand || ids_tensor->view_src == cand) {
                             ids_tensor = split->inputs[i];
                             ids_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[i]);
                             break;

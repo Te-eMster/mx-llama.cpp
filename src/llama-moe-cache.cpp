@@ -458,6 +458,11 @@ struct llama_moe_cache::impl {
         }
         GGML_ASSERT(ggml_is_contiguous(sel));
 
+        // shared views resolve to their original source - the copy may not be filled yet
+        while (sel->view_src != nullptr) {
+            sel = sel->view_src;
+        }
+
         ids.resize(ggml_nelements(sel));
         ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
         ggml_backend_synchronize(backend);
