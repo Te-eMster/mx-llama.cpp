@@ -60,61 +60,60 @@ Note: the layer-13 pattern (root crosses in split 9, view in split 11) survives
 only by accident - the root copy is re-registered as a graph node at split 11 and
 therefore re-allocated. The fix below makes both patterns robust.
 
-## Fix (minimal, keeps the performance win)
+## Fix (revised: lifetime reference instead of pinning)
 
-In [`ggml/src/ggml-backend.cpp`](../ggml/src/ggml-backend.cpp), inside the
-`share_root` block (~line 1907): pin the root copy unconditionally, not only on
-fresh creation.
+The first fix attempt pinned the root copy with `ggml_set_output()` so ggml-alloc
+never frees it. Correctness was restored, but prefill performance collapsed to
+the `GGML_SCHED_SHARE_VIEW_INPUTS=0` level: every pinned root copy
+(e.g. `ffn_norm-27`, 32 MB at prefill, one per layer) lives to graph end, so the
+compute buffer cannot recycle the slot across layers (~1 GB extra, see
+`sched_reserve`: 3624 MiB with sharing vs 2560 MiB without). The `=0` path frees
+each copy after its consumers and reuses one slot for all layers.
 
-```cpp
-if (share_root) {
-    const size_t root_id = hash_id(root);
-    ggml_backend_t backend = sched->backends[cur_backend_id];
-    if (tensor_id_copy(root_id, cur_backend_id, 0) == NULL) {
-        for (int c = 0; c < sched->n_copies; c++) {
-            struct ggml_tensor * root_copy = ggml_dup_tensor_layout(sched->ctx, root);
-            ggml_format_name(root_copy, "%s#%s#%d", ggml_backend_name(backend), root->name, c);
-            tensor_id_copy(root_id, cur_backend_id, c) = root_copy;
-            SET_CAUSE(root_copy, "4.cpy");
-        }
-    }
-    // a shared view-copy holds no allocator reference on its root, so the copy
-    // must stay pinned even when a plain crossing created it earlier
-    for (int c = 0; c < sched->n_copies; c++) {
-        ggml_set_input(tensor_id_copy(root_id, cur_backend_id, c));
-        ggml_set_output(tensor_id_copy(root_id, cur_backend_id, c));
-    }
-    ...
-}
-```
+The root copy must live exactly until the last consumer of its shared views -
+not forever. That is what `n_views` is for: ggml-alloc already frees a view's
+`view_src` when the view's own consumers are done and its counted reference
+drops ([`ggml-alloc.c`](../ggml/src/ggml-alloc.c) free path). Scheduler-shared
+input views were deliberately uncounted, which is only safe when the root is
+pinned - the broken combination was "uncounted + unpinned".
+
+Changes:
+
+1. [`ggml/src/ggml-alloc.c`](../ggml/src/ggml-alloc.c) count phase: count an
+   `n_views` reference for view srcs that are not graph nodes (the scheduler's
+   shared input views), deduplicated with the existing `counted_view` flag.
+   Graph-node views keep their existing node-based counting.
+2. [`ggml/src/ggml-backend.cpp`](../ggml/src/ggml-backend.cpp) `share_root`
+   block: drop the `ggml_set_output()` pin (keep `ggml_set_input()`); the
+   reference now provides the lifetime.
+3. [`FEATURES.md`](../FEATURES.md): the invariant text updated accordingly.
 
 Effects:
 
-- `GGML_TENSOR_FLAG_OUTPUT` makes ggml-alloc never free/reuse the root copy
-  while any shared view of it is live - restores the documented invariant
-  (FEATURES.md: "a shared input view takes no n_views reference on its root").
-- `GGML_TENSOR_FLAG_INPUT` matches what the fresh-creation path already does.
-- No extra cost: the fresh-creation path already pins; the reuse path only adds
-  the pin for the few roots that also cross directly (MiMo decode: probs roots).
-- Sharing stays active, so the ~50% prefill gain is preserved.
+- The root copy is freed right after the last shared-view consumer, so the slot
+  recycles across layers - memory profile back to the `=0` level.
+- The use-after-free is gone: the reference keeps the copy alive while any
+  shared view is consumed, including the MiMo decode layer 6 case where the
+  root is also consumed directly earlier in the same split.
+- Crossings stay single-copy, so the transfer saving remains.
 
 ## Steps
 
-1. Edit the `share_root` block in `ggml/src/ggml-backend.cpp` as shown above
-   (hoist `ggml_set_input`/`ggml_set_output` out of the creation-only branch).
-2. Rebuild (same HIP build as used for the logs).
-3. Correctness check: run MiMo V2.6 Flash with `GGML_SCHED_SHARE_VIEW_INPUTS=1`,
+1. Rebuild (same HIP build as used for the logs).
+2. Correctness check: run MiMo V2.6 Flash with `GGML_SCHED_SHARE_VIEW_INPUTS=1`,
    greedy (temp 0), same prompt as the logs; compare with the
    `GGML_SCHED_SHARE_VIEW_INPUTS=0` output - must be byte-identical.
-4. Perplexity check: `llama-perplexity` on a small text sample with
+3. Perplexity check: `llama-perplexity` on a small text sample with
    `GGML_SCHED_SHARE_VIEW_INPUTS=0` vs `=1` - results must match.
-5. Performance check: prefill t/s with `=1` must be back to the fast level
-   (no -50%). Compare with a fixed config (`-fit off`, explicit `-ts`/`-ngl`),
-   since the fit picks different splits per mode (log 0: splits 172/75,
-   log 1: 180/83) and that alone skews benchmarks.
-6. Debug check: run with `GGML_SCHED_DEBUG=1` and confirm no
+4. Performance check: prefill t/s with `=1` must be back to the fast level
+   (no -50%) and `sched_reserve` compute buffer sizes must be near the
+   `=0` run (2560 MiB-class), not the pinned 3624 MiB. Compare with a fixed
+   config (`-fit off`, explicit `-ts`/`-ngl`): the fit picks different splits
+   per mode (log 0: splits 172/75, log 1: 180/83) and small buffer deltas can
+   flip its choice, which alone skews benchmarks.
+5. Debug check: run with `GGML_SCHED_DEBUG=1` and confirm no
    `fill-order violation` lines and stable `rebind ... needs_realloc=0`.
-7. Run `ctest` (test-backend-ops, test-scheduler-*) for regressions.
+6. Run `ctest` (test-backend-ops, test-scheduler-*) for regressions.
 
 ## Optional hardening (separate, discuss first)
 

@@ -867,7 +867,7 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
         // GGML_OP_NONE does not appear normally in the graph nodes, but is used by ggml-backend to add dependencies to
         // control when some tensors are allocated and freed. in this case, the dependencies are in `src`, but the node
         // itself is never used and should not be considered a dependency
-        if (ggml_impl_is_view(node) && node->op != GGML_OP_NONE) {
+        if (ggml_impl_is_view(node) && node->op != GGML_OP_NONE && !ggml_gallocr_hash_get(galloc, node)->counted_view) {
             struct ggml_tensor * view_src = node->view_src;
             ggml_gallocr_hash_get(galloc, view_src)->n_views += 1;
             ggml_gallocr_hash_get(galloc, node)->counted_view = true;
@@ -884,6 +884,13 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
             }
 
             ggml_gallocr_hash_get(galloc, src)->n_children += 1;
+
+            // scheduler-shared input views are not graph nodes; count their reference
+            // on the root here so the root copy lives until the last view consumer
+            if (ggml_impl_is_view(src) && src->op != GGML_OP_NONE && !ggml_gallocr_hash_get(galloc, src)->counted_view) {
+                ggml_gallocr_hash_get(galloc, src->view_src)->n_views += 1;
+                ggml_gallocr_hash_get(galloc, src)->counted_view = true;
+            }
 
             // allocate explicit inputs
             if (src->flags & GGML_TENSOR_FLAG_INPUT) {

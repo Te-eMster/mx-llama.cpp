@@ -352,8 +352,8 @@ selectively by the MoE expert copy, and repack buffers interleave bytes per
 shape, so span equality is not byte equality there.
 
 `GGML_SCHED_DEBUG=1` logs each share event and each MoE expert copy, at no cost
-when the flag is off. The graph allocator counts only the views it registered,
-so a shared input view takes no `n_views` reference on its root.
+when the flag is off. A shared input view is counted like any other view of its
+root, so the root copy lives until the last view consumer and is then recycled.
 
 ## Multi-GPU transfer tuning
 
