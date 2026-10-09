@@ -522,6 +522,7 @@ struct ggml_gallocr {
 
     struct gallocr_layout layouts[GGML_GALLOC_MAX_LAYOUTS];
     int64_t layout_uses;
+    uint64_t active_key;     // topology checksum of the active layout (0 = unknown)
     uint64_t active_key_ids; // buffer-id checksum of the active layout (0 = unknown)
     bool layout_cache_enabled;
 };
@@ -616,6 +617,7 @@ static uint64_t ggml_gallocr_ids_key(const struct ggml_cgraph * graph,
 
 static void ggml_gallocr_layout_store(ggml_gallocr_t galloc, uint64_t key, uint64_t key_ids);
 static bool ggml_gallocr_layout_restore(ggml_gallocr_t galloc, struct ggml_cgraph * graph, uint64_t key_ids);
+static bool ggml_gallocr_alloc_graph_keyed(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids);
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
     ggml_gallocr_t galloc = (ggml_gallocr_t)calloc(1, sizeof(struct ggml_gallocr));
@@ -1082,11 +1084,16 @@ static bool ggml_gallocr_reserve_n_impl(
         }
     }
 
+    // record the active layout identity unconditionally: the rebind gate needs it even with the layout cache off
+    const uint64_t key = ggml_gallocr_graph_key(graph);
+    const uint64_t key_ids = ggml_gallocr_ids_key(graph, node_buffer_ids, leaf_buffer_ids);
+    galloc->active_key     = key;
+    galloc->active_key_ids = key_ids;
+
     // cache the freshly reserved layout under the graph's topology key so
     // later same-topology graphs can re-bind without a reserve
     if (!no_alloc) {
-        ggml_gallocr_layout_store(galloc, ggml_gallocr_graph_key(graph),
-                ggml_gallocr_ids_key(graph, node_buffer_ids, leaf_buffer_ids));
+        ggml_gallocr_layout_store(galloc, key, key_ids);
     }
 
     return true;
@@ -1158,6 +1165,16 @@ static bool ggml_gallocr_realloc_trace(void) {
     static int flag = -1;
     if (flag < 0) {
         const char * env = getenv("GGML_ALLOC_REALLOC_TRACE");
+        flag = env != NULL && atoi(env) != 0;
+    }
+    return flag != 0;
+}
+
+// GGML_SCHED_DEBUG=1 also enables the rebind diagnostics below
+static bool ggml_gallocr_debug(void) {
+    static int flag = -1;
+    if (flag < 0) {
+        const char * env = getenv("GGML_SCHED_DEBUG");
         flag = env != NULL && atoi(env) != 0;
     }
     return flag != 0;
@@ -1360,6 +1377,7 @@ static bool ggml_gallocr_layout_restore(ggml_gallocr_t galloc, struct ggml_cgrap
         memcpy(galloc->leaf_allocs, lay->leaf_allocs, lay->n_leafs*sizeof(struct leaf_alloc));
         galloc->n_nodes = lay->n_nodes;
         galloc->n_leafs = lay->n_leafs;
+        galloc->active_key = lay->key;
         galloc->active_key_ids = lay->key_ids;
         lay->last_used  = ++galloc->layout_uses;
 
@@ -1390,11 +1408,24 @@ bool ggml_gallocr_alloc_graph_ids(ggml_gallocr_t galloc, struct ggml_cgraph * gr
             return false;
         }
     }
-    return ggml_gallocr_alloc_graph(galloc, graph);
+    return ggml_gallocr_alloc_graph_keyed(galloc, graph, node_buffer_ids, leaf_buffer_ids);
 }
 
-bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
-    if (ggml_gallocr_needs_realloc(galloc, graph) && !ggml_gallocr_layout_restore(galloc, graph, 0)) {
+static bool ggml_gallocr_alloc_graph_keyed(ggml_gallocr_t galloc, struct ggml_cgraph * graph,
+        const int * node_buffer_ids, const int * leaf_buffer_ids) {
+    // fits cannot see per-index identity churn: rebind only when the active layout was built for this exact graph;
+    // when n_buffers > 2 the buffer-id assignment must match as well (skipped when the caller supplies no ids)
+    const uint64_t key = ggml_gallocr_graph_key(graph);
+    bool identity_ok = key == galloc->active_key;
+    if (identity_ok && galloc->n_buffers > 2 && node_buffer_ids != NULL) {
+        identity_ok = galloc->active_key_ids == ggml_gallocr_ids_key(graph, node_buffer_ids, leaf_buffer_ids);
+    }
+    const bool needs_realloc = ggml_gallocr_needs_realloc(galloc, graph);
+    if (ggml_gallocr_debug()) {
+        GGML_LOG_DEBUG("%s: rebind key=%016llx active_key=%016llx needs_realloc=%d\n", __func__,
+                (unsigned long long) key, (unsigned long long) galloc->active_key, needs_realloc ? 1 : 0);
+    }
+    if ((!identity_ok || needs_realloc) && !ggml_gallocr_layout_restore(galloc, graph, 0)) {
         if (galloc->n_buffers == 1) {
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: reallocating buffers automatically\n", __func__);
@@ -1439,6 +1470,10 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
     }
 
     return true;
+}
+
+bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
+    return ggml_gallocr_alloc_graph_keyed(galloc, graph, NULL, NULL);
 }
 
 size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {

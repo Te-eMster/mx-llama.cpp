@@ -1877,6 +1877,15 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 const int src_backend_id = sched->hv_tensor_backend_ids[src_id];
                 GGML_ASSERT(src_backend_id != -1); // all inputs should be assigned by now
 
+                if (sched->debug && src_backend_id != cur_backend_id &&
+                        src->buffer != NULL &&
+                        ggml_backend_buffer_get_usage(src->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                        ggml_backend_buffer_is_host(src->buffer)) {
+                    GGML_LOG_DEBUG("%s: host weight cross %s backends %d -> %d supported=%d has_copy=%d\n", __func__,
+                        src->name, src_backend_id, cur_backend_id,
+                        ggml_backend_sched_buffer_supported(sched, src, cur_backend_id) ? 1 : 0,
+                        tensor_id_copy(src_id, cur_backend_id, 0) != NULL ? 1 : 0);
+                }
                 if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
                     // a full-size view (a reshape of a layer output) is staged as a view of its source's copy, so the two cross once
                     static const bool share_view_inputs = [] {
@@ -1884,6 +1893,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         return e == NULL || atoi(e) != 0;
                     }();
                     struct ggml_tensor * root = src->view_src;
+                    // fill source of the copy consumed below: the shared root for shared view-copies, src otherwise
+                    struct ggml_tensor * fill_input = src;
                     // share only canonical-layout activation views: weights may be filled selectively (MoE expert copy)
                     // and repack buffers interleave bytes per shape, so span equality is not byte equality there
                     const bool share_root = share_view_inputs && root != NULL && tensor_id_copy(src_id, cur_backend_id, 0) == NULL &&
@@ -1905,12 +1916,27 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                                 tensor_id_copy(root_id, cur_backend_id, c) = root_copy;
                                 SET_CAUSE(root_copy, "4.cpy");
                             }
+                        }
+                        // one shared copy per root, but each consuming split re-registers the fill so it is refilled before that split runs
+                        bool registered = false;
+                        for (int k = 0; k < split->n_inputs; k++) {
+                            if (split->inputs[k] == root) {
+                                registered = true;
+                                break;
+                            }
+                        }
+                        if (!registered) {
                             int n_inputs = split->n_inputs++;
                             if (n_inputs >= split->inputs_capacity) {
                                 ggml_backend_sched_split_inputs_grow(split);
                             }
                             split->inputs[n_inputs] = root;
+                            if (sched->debug) {
+                                GGML_LOG_DEBUG("%s: share register %s (root of %s) backend %d split %d n_inputs %d\n", __func__,
+                                    root->name, src->name, cur_backend_id, i_split, split->n_inputs);
+                            }
                         }
+                        fill_input = root;
                         for (int c = 0; c < sched->n_copies; c++) {
                             struct ggml_tensor * tensor_copy = ggml_view_4d(sched->ctx, tensor_id_copy(root_id, cur_backend_id, c),
                                 src->ne[0], src->ne[1], src->ne[2], src->ne[3], src->nb[1], src->nb[2], src->nb[3], 0);
@@ -1943,8 +1969,48 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                             ggml_backend_sched_split_inputs_grow(split);
                         }
                         split->inputs[n_inputs] = src;
+                    } else {
+                        // the copy already exists from an earlier crossing: re-register its fill so this split refills it before computing
+                        struct ggml_tensor * copy0 = tensor_id_copy(src_id, cur_backend_id, 0);
+                        if (root != NULL && copy0->view_src != NULL && copy0->view_src == tensor_id_copy(hash_id(root), cur_backend_id, 0)) {
+                            fill_input = root; // shared view-copy: the shared root is its fill source
+                        }
+                        bool registered = false;
+                        for (int k = 0; k < split->n_inputs; k++) {
+                            if (split->inputs[k] == src || split->inputs[k] == fill_input) {
+                                registered = true;
+                                break;
+                            }
+                        }
+                        if (!registered) {
+                            int n_inputs = split->n_inputs++;
+                            if (n_inputs >= split->inputs_capacity) {
+                                ggml_backend_sched_split_inputs_grow(split);
+                            }
+                            split->inputs[n_inputs] = fill_input;
+                            if (sched->debug) {
+                                GGML_LOG_DEBUG("%s: share register %s (for %s) backend %d split %d n_inputs %d\n", __func__,
+                                    fill_input->name, src->name, cur_backend_id, i_split, split->n_inputs);
+                            }
+                        }
                     }
                     node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
+                    if (sched->debug) {
+                        // fill-order diagnostic: the fill must be registered at or before its consuming split
+                        int registering_split = -1;
+                        for (int s = 0; s <= i_split && registering_split == -1; s++) {
+                            for (int k = 0; k < sched->splits[s].n_inputs; k++) {
+                                if (sched->splits[s].inputs[k] == fill_input) {
+                                    registering_split = s;
+                                    break;
+                                }
+                            }
+                        }
+                        if (registering_split == -1 || registering_split > i_split) {
+                            GGML_LOG_DEBUG("%s: fill-order violation: %s (fill %s) consumed in split %d registers its fill in split %d\n", __func__,
+                                src->name, fill_input->name, i_split, registering_split);
+                        }
+                    }
                 }
             }
         }
@@ -2577,6 +2643,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             input->name, expert_size, first_id, last_id);
                     }
                 } else {
+                    if (sched->debug &&
+                            input->buffer != NULL &&
+                            ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                            ggml_backend_buffer_is_host(input->buffer)) {
+                        GGML_LOG_DEBUG("%s: expert-staging gate miss %s nodes0=%s op=%s\n", __func__, input->name,
+                            split->graph.n_nodes > 0 ? node->name : "none",
+                            split->graph.n_nodes > 0 ? ggml_op_desc(node) : "none");
+                    }
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     t0 = ggml_backend_sched_timing_now(sched);
