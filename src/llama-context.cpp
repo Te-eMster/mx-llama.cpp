@@ -462,7 +462,8 @@ llama_context::llama_context(
             cparams.offload_kqv &&
             !model.has_tensor_overrides() &&
             ((model.split_mode() == LLAMA_SPLIT_MODE_LAYER && model.n_devices() > 1) ||
-             model.split_mode() == LLAMA_SPLIT_MODE_TENSOR);
+             model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) &&
+            cparams.moe_cache_size == 0; // not supported by the MoE cache
 
         // The MTP draft context replays only a few small (single-layer) decodes at begin(); a deep
         // pipeline ring adds idle compute-buffer copies with no throughput benefit for that tiny
@@ -512,19 +513,7 @@ llama_context::llama_context(
         }
 
         if (cparams.moe_cache_size > 0) {
-            if (cparams.pipeline_parallel || model.n_devices() > 1) {
-                throw std::runtime_error("MoE cache does not support multiple devices");
-            }
-            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
-                const auto type = ggml_backend_dev_type(ggml_backend_get_device(backend_ptrs[i]));
-                if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-                    moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs[i], backend_buft[i], cparams.moe_cache_size);
-                    break;
-                }
-            }
-            if (!moe_cache) {
-                throw std::runtime_error("MoE cache requires a GPU backend");
-            }
+            moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
         }
 
         sched_reserve();
