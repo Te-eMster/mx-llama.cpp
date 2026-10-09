@@ -1911,11 +1911,14 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                             for (int c = 0; c < sched->n_copies; c++) {
                                 struct ggml_tensor * root_copy = ggml_dup_tensor_layout(sched->ctx, root);
                                 ggml_format_name(root_copy, "%s#%s#%d", ggml_backend_name(backend), root->name, c);
-                                ggml_set_input(root_copy);
-                                ggml_set_output(root_copy); // prevent ggml-alloc from overwriting the tensor
                                 tensor_id_copy(root_id, cur_backend_id, c) = root_copy;
                                 SET_CAUSE(root_copy, "4.cpy");
                             }
+                        }
+                        // a shared view-copy takes no allocator reference on the root, so pin the copy even when a plain crossing created it earlier
+                        for (int c = 0; c < sched->n_copies; c++) {
+                            ggml_set_input(tensor_id_copy(root_id, cur_backend_id, c));
+                            ggml_set_output(tensor_id_copy(root_id, cur_backend_id, c)); // prevent ggml-alloc from overwriting the tensor
                         }
                         // one shared copy per root, but each consuming split re-registers the fill so it is refilled before that split runs
                         bool registered = false;
